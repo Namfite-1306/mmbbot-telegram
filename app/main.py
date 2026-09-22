@@ -7,6 +7,8 @@ import re
 import sys
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from telegram import Bot, BotCommand, Update
 from telegram.error import InvalidToken, NetworkError, TelegramError
@@ -14,8 +16,10 @@ from telegram.ext import Application, ApplicationBuilder
 
 from app.bot.handlers import BotHandlers
 from app.config import ConfigurationError, Settings
-from app.market_store import CLEAN_DIR, MarketStore
+from app.market_store import CLEAN_DIR, MarketStore, previous_weekday
 from app.providers import MockSignalProvider, SignalProvider, StrategySignalProvider
+from app.providers.base import ProviderError
+from app.strategy_engine import VietcapStrategyEngine
 from app.services import NotificationService, SignalService, SubscriptionService
 from app.storage import Database, NotificationRepository, SettingsRepository, UserRepository, WatchlistRepository
 
@@ -106,6 +110,33 @@ async def _alert_loop(application: Application, runtime: Runtime, interval_secon
         await asyncio.sleep(interval_seconds)
 
 
+async def _eod_refresh_loop(provider: StrategySignalProvider) -> None:
+    """Fill the previous weekday in the background; /scan itself stays network-free."""
+    store = provider.engine.store
+    while True:
+        today = datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).date()
+        expected = previous_weekday(today).isoformat()
+        delay = 3600
+        try:
+            if store.last_eod_refresh_date() != expected or store.last_scan_session(today) != expected:
+                logger.info("Refreshing finalized EOD market data for %s", expected)
+
+                def refresh_locked() -> dict:
+                    with provider._refresh_lock:
+                        return store.refresh(include_fundamentals=False)
+
+                await asyncio.to_thread(refresh_locked)
+                if store.last_scan_session(today) != expected or store.last_eod_refresh_date() != expected:
+                    raise RuntimeError("Nguồn dự phòng chưa xác nhận đủ phiên cuối ngày")
+                provider._scan_revision += 1
+                provider._scan_cache = None
+                logger.info("EOD market data ready for %s", expected)
+        except Exception as exc:
+            logger.warning("EOD refresh for %s failed; will retry: %s", expected, exc, exc_info=True)
+            delay = 4 * 3600
+        await asyncio.sleep(delay)
+
+
 def build_application(settings: Settings, runtime: Runtime | None = None) -> Application:
     runtime = runtime or build_runtime(settings)
 
@@ -140,14 +171,23 @@ def build_application(settings: Settings, runtime: Runtime | None = None) -> App
             update_command_menu(), name="update-command-menu")
         if settings.signal_provider == "strategy":
             async def startup_scan() -> None:
-                signals = await runtime.signal_service.scan()
-                application.bot_data["startup_scan_count"] = len(signals)
-                logger.info("Startup market scan evaluated %s symbols", len(signals))
+                try:
+                    signals = await runtime.signal_service.scan()
+                    application.bot_data["startup_scan_count"] = len(signals)
+                    logger.info("Startup market scan evaluated %s symbols", len(signals))
+                except ProviderError as exc:
+                    logger.info("Startup scan waits for EOD data: %s", exc)
             # post_init runs before Application.start(); manage these background
             # tasks ourselves instead of calling Application.create_task early.
             application.bot_data["startup_scan_task"] = asyncio.create_task(
                 startup_scan(), name="startup-market-scan"
             )
+            provider = getattr(runtime.signal_service, "provider", None)
+            if (isinstance(provider, StrategySignalProvider)
+                    and isinstance(provider.engine, VietcapStrategyEngine)):
+                application.bot_data["eod_refresh_task"] = asyncio.create_task(
+                    _eod_refresh_loop(provider), name="eod-market-refresh"
+                )
         if settings.enable_mock_alert_scheduler:
             application.bot_data["mock_alert_task"] = asyncio.create_task(
                 _alert_loop(application, runtime, settings.mock_alert_interval_seconds),
@@ -156,7 +196,7 @@ def build_application(settings: Settings, runtime: Runtime | None = None) -> App
             logger.info("Mock alert scheduler enabled")
 
     async def post_shutdown(application: Application) -> None:
-        for key in ("mock_alert_task", "startup_scan_task", "command_menu_task"):
+        for key in ("mock_alert_task", "startup_scan_task", "command_menu_task", "eod_refresh_task"):
             task = application.bot_data.get(key)
             if task:
                 task.cancel()

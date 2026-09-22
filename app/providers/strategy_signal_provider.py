@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from app.models import Action, Signal, SignalStatus
-from app.market_store import BOT_DIR, CLEAN_DIR, MarketStore
+from app.market_store import BOT_DIR, CLEAN_DIR, MarketStore, previous_weekday
 from app.providers.base import ProviderError, SignalProvider, TickerNotFoundError
 from app.strategy_engine import (SampleStrategyEngine, StrategyDataError, VietcapStrategyEngine,
                                  calculate_total_score, market_regime)
@@ -220,7 +220,9 @@ class StrategySignalProvider(SignalProvider):
                 scan_day = await asyncio.to_thread(
                     self.engine.store.last_scan_session, self._current_time().date())
                 if not scan_day:
-                    raise ProviderError("Chưa có phiên VNINDEX cuối ngày trước hôm nay trong database")
+                    expected = previous_weekday(self._current_time().date())
+                    raise ProviderError(f"Chưa có VNINDEX cuối ngày hợp lệ cho {expected}; "
+                                        "không dùng phiên cũ để quét")
                 self.last_scan_date = scan_day
                 cached = self._scan_cache
                 if cached and cached[0] == scan_day and monotonic() - cached[1] < 300:

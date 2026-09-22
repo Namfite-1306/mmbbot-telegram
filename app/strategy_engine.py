@@ -67,9 +67,13 @@ def _read_sector_map(path: str, mtime_ns: int) -> dict[str, str]:
         frame = pd.read_excel(source, sheet_name="Dữ liệu mô hình", usecols=["symbol", "sector_group"])
     else:
         frame = pd.read_csv(source, usecols=["symbol", "sector_group"])
-    frame = frame.dropna(subset=["symbol", "sector_group"])
-    return dict(zip(frame["symbol"].astype(str).str.upper().str.strip(),
-                    frame["sector_group"].astype(str).str.strip()))
+    frame["symbol"] = frame["symbol"].fillna("").astype(str).str.upper().str.strip()
+    frame["sector_group"] = frame["sector_group"].fillna("").astype(str).str.strip()
+    if frame[["symbol", "sector_group"]].eq("").any(axis=None):
+        raise StrategyDataError("Bản đồ ngành có mã hoặc nhóm ngành trống")
+    if frame["symbol"].duplicated().any():
+        raise StrategyDataError("Bản đồ ngành có mã trùng")
+    return dict(zip(frame["symbol"], frame["sector_group"]))
 
 
 @lru_cache(maxsize=256)
@@ -206,7 +210,7 @@ class SampleStrategyEngine:
     def momentum(self, prices: pd.DataFrame, index: pd.DataFrame) -> float:
         merged = prices[["date", "close"]].merge(index[["date", "close"]], on="date", suffixes=("_stock", "_index"))
         if len(merged) < 21 or merged.iloc[-1]["date"] != prices.iloc[-1]["date"]:
-            raise StrategyDataError("VNINDEX chưa đủ phiên trùng với mã để tính sức mạnh tương đối")
+            raise StrategyDataError("Benchmark chưa đủ 21 phiên trùng với mã hoặc thiếu đúng phiên phân tích")
         current = merged.iloc[-1]
         rel5 = current["close_stock"] / merged.iloc[-6]["close_stock"] - current["close_index"] / merged.iloc[-6]["close_index"]
         rel20 = current["close_stock"] / merged.iloc[-21]["close_stock"] - current["close_index"] / merged.iloc[-21]["close_index"]
@@ -240,8 +244,12 @@ class SampleStrategyEngine:
             if pd.isna(row[key]):
                 raise StrategyDataError(f"Báo cáo {period} thiếu {key}; không quy đổi thành 0 điểm")
         for key in ("revenue", "net_profit"):
-            if pd.isna(previous[key]) or previous[key] <= 0:
+            if pd.isna(previous[key]):
                 raise StrategyDataError(f"Thiếu {key} cùng quý năm trước")
+            if previous[key] <= 0:
+                raise StrategyDataError(
+                    f"{key} cùng quý năm trước <= 0; chưa định nghĩa tăng trưởng tỷ lệ để tính F"
+                )
         debt_ratio = math.nan
         if not is_bank:
             source = _load_module(str(FUNDAMENTAL_SOURCE), "finbot_fundamental_engine")

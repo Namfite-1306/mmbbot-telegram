@@ -215,7 +215,11 @@ class BotHandlers:
 
     async def scan(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._ensure_user(update)
-        signals = await self.signal_service.scan()
+        try:
+            signals = await self.signal_service.scan()
+        except ProviderError as exc:
+            await self._reply(update, f"Chưa thể quét thị trường: {exc}. Bot đang cập nhật dữ liệu cuối ngày.")
+            return
         provider = self.signal_service.provider
         await self._reply(update, format_scan(
             signals, self.settings.timezone,

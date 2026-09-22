@@ -205,16 +205,19 @@ Unit test không gọi Telegram thật và dùng database tạm.
 ## Chạy chiến lược với dữ liệu DNSE, Vietcap và CafeF dự phòng
 
 Đặt `SIGNAL_PROVIDER=strategy` trong `.env`, rồi chạy `python -m app.main`.
-Lần khởi động đầu tiên import `cleaned_v2` vào SQLite. Tác vụ nền sau khởi động
-chỉ phân tích dữ liệu đã lưu, không crawl toàn thị trường.
+Lần khởi động đầu tiên import `cleaned_v2` vào SQLite. Sau khởi động, tác vụ nền
+kiểm tra và bổ sung dữ liệu cuối ngày của phiên làm việc liền trước; nếu nguồn
+lỗi, bot giữ dữ liệu đã lưu và thử lại sau. Không chạy crawl toàn thị trường
+ngay trong lệnh `/scan`.
 `/soi FPT` chỉ cập nhật giá FPT qua DNSE, rồi Vietcap, cuối cùng CafeF khi các nguồn trước lỗi; fundamental
 HSX/HNX vẫn cập nhật từ Vietcap. Dữ liệu được chuẩn hóa, kiểm tra OHLC/đơn vị giá
-và upsert vào DB rồi chấm điểm. `/scan` chọn phiên VNINDEX đã chốt gần nhất
-trước ngày hiện tại (cuối tuần có thể là thứ Sáu), chỉ đọc SQLite và chấm
-toàn bộ mã đến đúng phiên đó. Dữ liệu trong ngày không lọt vào `/scan`;
-nếu dữ liệu đã quá cũ, bot chặn tín hiệu giao dịch. `/scan` không tự cập nhật
-toàn thị trường: để luôn có dữ liệu phiên trước, cần chạy job EOD thu thập
-và import riêng sau khi thị trường đóng cửa. Job đó chưa được cấu hình ở đây.
+và upsert vào DB rồi chấm điểm. `/scan` chỉ dùng VNINDEX đã chốt của ngày làm
+việc liền trước (ví dụ 23/09 dùng 22/09), chỉ đọc SQLite và chấm toàn bộ mã
+đến đúng phiên đó. Nếu phiên kỳ vọng chưa có, bot báo thiếu dữ liệu thay vì
+âm thầm dùng phiên cũ. Cuối tuần lùi về thứ Sáu; lịch nghỉ lễ chưa được tích hợp.
+Tác vụ EOD tự chạy khi khởi động và kiểm tra lại mỗi giờ; cập nhật giá và chỉ
+số, không crawl lại toàn bộ báo cáo tài chính mỗi giờ. Khi nguồn lỗi, tác vụ
+thử lại sau bốn giờ.
 Kết quả `/scan` cùng phiên được giữ trong bộ nhớ tối đa 5 phút để các lệnh lặp
 lại trả nhanh; `/soi` làm mới dữ liệu sẽ xóa cache này.
 
@@ -267,10 +270,44 @@ báo cáo, đã công bố trước ngày tín hiệu. Nếu thiếu phân ngàn
 thiếu hợp lệ và mã đi nhánh Technical-only; không tự gán F=0. Nếu đã có ngành
 nhưng thiếu peer hoặc chỉ số định giá không hợp lệ, phần valuation tương ứng
 được loại khỏi mẫu số F. Workbook mẫu có `sector_group` cho 15 mã, còn live
-Vietcap không dùng bản đồ ngành từ mẫu để suy rộng toàn thị trường. Để bật
-so sánh ngành live, cung cấp `industry_map.csv` trong
-thư mục `Bot tele` với các cột `symbol,sector_group`. Hiện dữ liệu Vietcap đã
-import chưa có cột ngành toàn thị trường, nên không tự suy đoán ngành.
+Vietcap không dùng bản đồ ngành từ mẫu để suy rộng toàn thị trường.
+`industry_map.csv` tại gốc bot có đúng hai cột `symbol,sector_group`;
+`sector_group` là mã ngành ICB cấp 2 (`ICB2:<code>`) từ
+[Vietcap IQ](https://iq.vietcap.com.vn/api/iq-insight-service/v2/company/search-bar?language=1),
+đối chiếu với danh sách STOCK HSX/HNX trong SQLite. Lần truy xuất
+22/09/2026: 704/704 mã có ngành, không có ngành trống hoặc mã ngoài danh sách.
+Sau `pip install -r requirements.txt`, tạo lại bằng
+`python scripts/build_score_inputs.py industry`. Đây là ảnh chụp
+phân ngành ngày lấy, **không phải** lịch sử phân ngành point-in-time; khi
+backtest ngày trước 22/09/2026 phải có snapshot ngành lịch sử riêng để loại
+khả năng look-ahead. Có ngành không thay thế được báo cáo quý thiếu. F lọc
+`announcement_date <= signal_date`, nhưng SQLite hiện không giữ từng bản sửa
+đổi của cùng báo cáo; nếu nguồn từng điều chỉnh số liệu sau công bố, backtest
+lịch sử vẫn cần snapshot báo cáo gốc để xác minh point-in-time.
+
+Benchmark HNX lấy từ [báo cáo chỉ số từng phiên của Sở HNX](https://owa.hnx.vn/ftp/THONGKEGIAODICH/20260921/INDEX/20260921_ID_Thong_ke_thong_tin_chi_so.pdf),
+trích dòng `HNX Index` và xác minh ngày, OHLC trước khi ghi
+`cleaned data/cleaned_v2/index_data/cleaned_HNXINDEX.csv`. Lần lấy
+22/09/2026 có 260 phiên thật trong khoảng 03/09/2025–21/09/2026 (các ngày
+không tải được được liệt kê khi chạy script); đối chiếu lịch VNINDEX còn thiếu
+23/06/2026 và không tự điền giá. Ngày 21/09 đóng cửa 274,38. CSV này ở thư mục dữ liệu
+đã bị `.gitignore` loại khỏi Git. Tạo lại bằng
+`python scripts/build_score_inputs.py hnx-index --start 2025-09-01 --end 2026-09-21`;
+chỉ thêm `--allow-insecure-hnx` nếu máy báo lỗi chuỗi chứng chỉ TLS của host
+HNX. Tuỳ chọn này bỏ xác thực chứng chỉ cho đúng host tải PDF, không bỏ kiểm
+tra ngày/giá; cân nhắc cấu hình CA tin cậy trên máy triển khai. Khởi động bot
+hoặc gọi `MarketStore.import_directory(CLEAN_DIR, symbols=[])` để nạp CSV vào
+SQLite. M chỉ được tính khi có ít nhất 21 phiên trùng ngày của mã và chỉ số,
+bao gồm đúng phiên phân tích. Chuỗi 260 phiên cũng đủ tính EMA200 của HNXINDEX;
+với mã giao dịch thưa vẫn có thể thiếu 21 phiên giá trùng và M phải để trống.
+Luồng DNSE/Vietcap/CafeF hiện không tự lấy PDF HNX này; khi cần phiên HNX
+mới hơn, chạy lệnh tạo lại với `--end` là ngày quét rồi import CSV trước
+`/scan`. Không được dùng chuỗi cũ làm M cho một phiên mới.
+Đối soát cùng phiên bằng
+`python scripts/audit_score_inputs.py --as-of 2026-09-21`; cột "before" trong
+chương trình này là mô phỏng trạng thái trước khi có bảng ngành/HNXINDEX,
+không phải bản ghi tín hiệu đã lưu. Chỉ tín hiệu có giá đúng ngày quét mới
+được xem là hiện hành trong so sánh BUY/SELL.
 Các ngưỡng con là quyết định thiết kế V1, cần kiểm định bằng backtest.
 P/E, P/B trong CSV báo cáo chưa được kiểm chứng là snapshot đúng tại từng
 ngày lịch sử; mặc định valuation tắt (`valuation_verified=False`) cho cả bot

@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from app.market_store import CRAWLER_DIR, MarketStore
+from app.market_store import CRAWLER_DIR, MarketStore, previous_weekday
 from app.main import build_application
 from app.config import Settings
 from app.models import SignalStatus
@@ -65,6 +65,40 @@ def test_import_is_idempotent_and_rejects_invalid_ohlc(tmp_path):
     assert store.last_scan_session(date(2026, 9, 18)) == "2026-09-17"
     assert store.latest_price_dates_through("2026-09-18") == {
         "AAA": "2026-09-18", "BBB": "2026-09-18"}
+
+
+def test_scan_requires_exact_prior_weekday_and_final_rows_cannot_regress(tmp_path):
+    source = tmp_path / "source"
+    _write_csv(source / "market_data" / "AAA.csv", [
+        {"symbol": "AAA", "trade_date": "2026-09-21", "open": 10, "high": 11,
+         "low": 9, "close": 10, "volume": 100, "is_final": True},
+    ])
+    _write_csv(source / "index_data" / "VNINDEX.csv", [
+        {"symbol": "VNINDEX", "trade_date": "2026-09-21", "close": 1799.67,
+         "is_final": True},
+    ])
+    store = MarketStore(tmp_path / "market.db")
+    store.import_directory(source)
+    assert store.last_scan_session(date(2026, 9, 22)) == "2026-09-21"
+    assert store.last_scan_session(date(2026, 9, 23)) is None
+    with store.connect() as conn:
+        conn.execute("""INSERT INTO market_indices(symbol,trade_date,close,is_final)
+            VALUES('VNINDEX','2026-09-22',1800,1)""")
+    assert store.last_scan_session(date(2026, 9, 23)) == "2026-09-22"
+    _write_csv(source / "market_data" / "AAA.csv", [
+        {"symbol": "AAA", "trade_date": "2026-09-21", "open": 10, "high": 11,
+         "low": 9, "close": 10.5, "volume": 20, "is_final": False},
+    ])
+    _write_csv(source / "index_data" / "VNINDEX.csv", [
+        {"symbol": "VNINDEX", "trade_date": "2026-09-21", "close": 1809.21,
+         "is_final": False},
+    ])
+    store.import_directory(source)
+    with store.connect() as conn:
+        price = conn.execute("SELECT close,is_final FROM market_prices WHERE symbol='AAA'").fetchone()
+        index = conn.execute("SELECT close,is_final FROM market_indices WHERE symbol='VNINDEX'").fetchone()
+    assert tuple(price) == (10.0, 1)
+    assert tuple(index) == (1799.67, 1)
 
 
 def test_strategy_scan_uses_previous_session_without_network(tmp_path, monkeypatch):
@@ -150,9 +184,10 @@ def test_scan_passes_previous_session_cutoff_to_every_symbol(monkeypatch):
 def test_full_refresh_skips_second_eod_crawl(tmp_path, monkeypatch):
     store = MarketStore(tmp_path / "market.db")
     store.initialize()
-    today = datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).date().isoformat()
+    today = previous_weekday(datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).date()).isoformat()
     with store.connect() as conn:
         conn.execute("INSERT INTO market_refresh_state VALUES('last_full_eod',?)", (today,))
+        conn.execute("INSERT INTO market_indices(symbol,trade_date,close,is_final) VALUES('VNINDEX',?,1000,1)", (today,))
     monkeypatch.setattr("app.market_store.importlib.import_module",
                         lambda name: pytest.fail(f"Unexpected crawler import: {name}"))
     assert "skipped" in store.refresh()
@@ -288,12 +323,16 @@ def test_market_scan_does_not_stop_on_stocks_without_recent_bars(tmp_path, monke
     with store.connect() as conn:
         conn.executemany("INSERT INTO market_symbols VALUES(?,'HSX','STOCK')",
                          [(f"A{i}",) for i in range(6)])
+        conn.execute("""INSERT INTO market_prices(symbol,trade_date,exchange,open,high,low,close,volume,is_final)
+            VALUES('A0',?,'HSX',100,100,100,100,1,1)""",
+            (previous_weekday(datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).date()).isoformat(),))
 
     class EmptyStocksClient:
         def __init__(self, *args, **kwargs):
             pass
 
         def get_ohlcv_bars(self, symbol, *args, **kwargs):
+            assert args[1] == previous_weekday(datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).date())
             return ([{"trade_date": "2026-09-21", "open": 100, "high": 100,
                       "low": 100, "close": 100, "volume": 1}]
                     if kwargs.get("index") else [])
@@ -303,14 +342,23 @@ def test_market_scan_does_not_stop_on_stocks_without_recent_bars(tmp_path, monke
                         lambda *args, **kwargs: (_ for _ in ()).throw(MarketNoDataError("no bars")))
     monkeypatch.setattr(store, "_refresh_cafef_symbol",
                         lambda *args, **kwargs: (_ for _ in ()).throw(CafeFNoDataError("no bars")))
-    monkeypatch.setattr(store, "_save_dnse_bars", lambda *args, **kwargs: 1)
+    def save_bars(symbol, bars, *, index):
+        if index and symbol == "VNINDEX":
+            with store.connect() as conn:
+                conn.execute("""INSERT INTO market_indices(symbol,trade_date,close,is_final)
+                    VALUES('VNINDEX',?,100,1)""",
+                    (previous_weekday(datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).date()).isoformat(),))
+        return 1
+
+    monkeypatch.setattr(store, "_save_dnse_bars", save_bars)
     monkeypatch.setattr(store, "_refresh_vietcap_or_cafef_market",
                         lambda *args, **kwargs: pytest.fail("No-data is not a provider outage"))
     monkeypatch.setattr(store, "import_directory", lambda *args, **kwargs: {})
     monkeypatch.setattr("app.market_store.importlib.import_module",
                         lambda name: SimpleNamespace(crawl_fundamental_data=lambda *a, **k: {"failed": 0}))
     result = store.refresh()
-    assert result["empty"] == 6
+    assert result["already_final"] == 1
+    assert result["empty"] == 5
     assert result["failed"] == []
 
 

@@ -129,6 +129,24 @@ def test_industry_valuation_uses_only_announced_same_period_peers() -> None:
         engine.fundamental("AAA", pd.Timestamp("2025-04-30"), "HSX")
 
 
+def test_fundamental_distinguishes_negative_base_from_missing_report() -> None:
+    class Engine(SampleStrategyEngine):
+        def _sector_map(self):
+            return {"AAA": "ICB2:1700"}
+
+        def _fundamental_frame(self, ticker):
+            return pd.DataFrame([
+                {"report_type": "quarterly", "report_period": "2025Q2", "announcement_date": "2025-08-01",
+                 "revenue": 100, "net_profit": -10},
+                {"report_type": "quarterly", "report_period": "2026Q2", "announcement_date": "2026-08-01",
+                 "revenue": 120, "net_profit": 12, "total_equity": 100, "operating_cash_flow": 5,
+                 "eps": 1, "roe": 0.2, "total_debt": 50},
+            ])
+
+    with pytest.raises(StrategyDataError, match="net_profit cùng quý năm trước <= 0"):
+        Engine().fundamental("AAA", pd.Timestamp("2026-09-21"), "HSX")
+
+
 def test_workbook_loader_never_reads_future_targets() -> None:
     if not SAMPLE_BOOK.is_file():
         pytest.skip("User sample workbook not present")

@@ -58,15 +58,16 @@ def run_pipeline(
     workers: int,
     min_interval: float,
     include_fundamental: bool,
+    end_date: date | None = None,
 ) -> dict:
     started = datetime.now()
     refresh_universe()
     cache_path = DATA_DIR / "symbol_info_cache.csv"
     market_symbols = load_market_stock_symbols(cache_path, ["HSX", "HNX", "UPCOM"])
     fundamental_symbols = load_stock_symbols(cache_path, ["HSX", "HNX"])
-    snapshot_rows = save_latest_and_daily_priceboard(min_interval)
+    snapshot_rows = save_latest_and_daily_priceboard(min_interval) if end_date is None else 0
 
-    end_date = date.today()
+    end_date = end_date or date.today()
     market_start = start_date if mode == "bootstrap" else end_date - timedelta(days=lookback_days)
     market_summary = crawl_market_data(
         symbols=market_symbols,
