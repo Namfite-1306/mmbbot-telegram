@@ -1,0 +1,7 @@
+# Không đẩy các file dữ liệu/log lên Git (mỗi máy sẽ tự sinh ra khi chạy)
+data/*.db
+logs/*.log
+__pycache__/
+*.pyc
+.env
+venv/

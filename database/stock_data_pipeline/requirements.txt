@@ -1,0 +1,7 @@
+pandas
+requests
+schedule
+
+# --- Chỉ cần nếu dùng DB_ENGINE=postgres (xem README mục "Dùng PostgreSQL") ---
+psycopg2-binary
+python-dotenv
