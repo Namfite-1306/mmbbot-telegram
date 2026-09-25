@@ -64,11 +64,16 @@ DATABASE_PATH=data/fintech_bot.db
 TIMEZONE=Asia/Ho_Chi_Minh
 LOG_LEVEL=INFO
 MAX_TICKERS_PER_MESSAGE=10
+DIGEST_TIME=17:30
+# Chỉ điền khi bạn muốn bot báo lỗi/khôi phục EOD vào chat quản trị đã mở bot.
+ADMIN_CHAT_ID=
 DNSE_API_KEY=your_key
 DNSE_API_SECRET=your_secret
 ```
 
 `.env` đã được ignore. Không commit token thật.
+Nếu chưa có chat quản trị, để `ADMIN_CHAT_ID` trống: lỗi EOD vẫn được ghi log
+và thấy qua `/status`, nhưng bot không tự nhắn cảnh báo ra ngoài.
 
 ## Chạy
 
@@ -98,6 +103,13 @@ Khởi động polling:
 python -m app.main
 ```
 
+Trên Windows, có thể dùng lệnh sau để tự khởi động lại khi Telegram mất kết nối
+lúc startup (exit code 4); các lỗi cấu hình khác sẽ dừng để kiểm tra:
+
+```powershell
+.\scripts\run_bot.ps1
+```
+
 Chỉ tạo database, không cần token:
 
 ```powershell
@@ -114,21 +126,24 @@ Log HTTP chi tiết của `httpx` bị hạ xuống mức `WARNING` và formatte
 | --- | --- |
 | `/start` | Giới thiệu bot |
 | `/help` | Hướng dẫn đầy đủ |
-| `/analyze FPT` hoặc `/soi FPT` | Gọi dữ liệu mới cho riêng FPT tại thời điểm yêu cầu, rồi xem phân tích và nút biểu đồ |
+| `/analyze FPT` hoặc `/soi FPT` | Phân tích từ nến cuối ngày đã lưu, gọi giá DNSE mới của riêng FPT tại thời điểm yêu cầu, rồi hiện nút biểu đồ |
 | `/chart FPT` | Gửi ảnh biểu đồ trực tiếp nếu không dùng được nút |
-| `/scan` | Không gọi API; phân tích toàn bộ mã từ phiên giao dịch hoàn tất gần nhất trước hôm nay đã lưu trong SQLite |
+| `/scan` | Không gọi API; từ SQLite chỉ quét VN100, bỏ mã thiếu điểm tổng/đứng giá và xếp top điểm cao, thấp |
 | `/add FPT HPG` | Thêm nhiều mã, tối đa 10 mã/người |
 | `/remove FPT HPG` | Xóa mã khỏi danh mục |
 | `/portfolio` | Xem tổng quan danh mục: giá, biến động %, trạng thái xanh/vàng/đỏ và ghi chú |
 | `/modelportfolio` | Vẽ sơ đồ phân bổ vốn mô phỏng theo `backtest_config.json` từ BUY HOSE của phiên cuối ngày đã lưu; không phải danh mục đang nắm giữ. Nếu thiếu ngành hoặc adjusted OHLC, giữ vốn ở tiền mặt và nêu lý do. |
-| `/paper` | Tạo/xem tài khoản giao dịch ảo, tiền mặt, vị thế và tài sản ước tính |
-| `/paperbuy FPT 100` | Xếp lệnh mua ảo 100 cổ phiếu HOSE; chưa khớp ngay |
-| `/papersell FPT 100` | Xếp lệnh bán ảo từ số cổ phiếu đang nắm giữ |
-| `/paperorders`, `/paperhistory` | Xem lệnh chờ hoặc 10 lệnh ảo gần nhất |
-| `/papercancel 123` | Hủy lệnh ảo còn đang chờ của chính mình |
+| `/paper` | Tạo/xem tài khoản giao dịch ảo, tiền mặt, vị thế, tài sản ước tính và biểu đồ tròn |
+| `/papercapital 120000000` | Đặt vốn góp mô phỏng thành 120 triệu VNĐ; chênh lệch cộng/trừ tiền mặt |
+| `/paperposition FPT 200 85000` | Nhập/chỉnh tuyệt đối 200 cổ phiếu FPT với giá vốn 85.000 VNĐ/cp; `0 0` để xóa |
+| `/paperbuy FPT 100` | Khớp mua ảo ngay 100 cổ phiếu HOSE theo giá khớp gần nhất từ API DNSE |
+| `/papersell FPT 100` | Khớp bán ảo ngay từ số cổ phiếu đang nắm giữ theo giá API DNSE |
+| `/paperorders`, `/paperhistory` | Xem lệnh chờ cũ (có nút hủy) hoặc 10 lệnh ảo gần nhất |
+| `/papercancel 123`, `/papercancel FPT` | Hủy một lệnh theo ID hoặc toàn bộ lệnh chờ của một mã |
 | `/alert on` | Bật cảnh báo |
 | `/alert off` | Tắt cảnh báo nhưng giữ danh mục |
-| `/status` | Kiểm tra provider, database và thời gian |
+| `/digest on`, `/digest off` | Tự chọn nhận/dừng tổng kết danh mục sau `DIGEST_TIME` (mặc định 17:30); mặc định tắt |
+| `/status` | Kiểm tra provider, database, phiên EOD cần có và trạng thái cập nhật |
 
 Bot cũng nhận text như `FPT` hoặc `HPG, FPT, VNM`. Một mã đơn lẻ có
 cùng nút biểu đồ với `/soi`; nhiều mã vẫn trả tóm tắt. Các lệnh cũ
@@ -136,26 +151,46 @@ cùng nút biểu đồ với `/soi`; nhiều mã vẫn trả tóm tắt. Các l
 nhưng menu Telegram dùng tên tiếng Anh. `/soi` được giữ vì có trong hướng
 dẫn người dùng; `/analyze` là tên tiếng Anh tương ứng. Nếu không thấy nút
 biểu đồ, dùng `/chart <MÃ>`; ảnh cần ít nhất 20 phiên giá đã chốt hợp lệ.
+Khi nhận lệnh, bot gửi `Vui lòng chờ phản hồi` rồi thay tin đó bằng kết quả; với
+biểu đồ ảnh, tin chờ được xóa sau khi gửi.
 
 ### Tài khoản giao dịch ảo (MVP)
 
-`/paper` chỉ hoạt động trong chat riêng với bot và `SIGNAL_PROVIDER=strategy`, dùng giá đã lưu trong SQLite.
+`/paper` chỉ hoạt động trong chat riêng với bot và `SIGNAL_PROVIDER=strategy`.
+Nút sau `/scan` chỉ mở hướng dẫn đặt lệnh ảo hoặc danh mục, không tự mua/bán.
 Mỗi chat riêng có tài khoản riêng; vốn ban đầu, phí, thuế, slippage, lô và số vị thế
 tối đa lấy từ `backtest_config.json`. Lệnh `/paperbuy` và `/papersell` là lệnh
 thủ công, **không phải tín hiệu hoặc lệnh gửi DNSE/VCI**. Bản đầu chỉ nhận cổ
 phiếu HOSE, không bán khống, không cho đặt vượt tiền khả dụng hoặc số cổ phiếu
-đang giữ. Lệnh mua mới dựa trên giá đóng cửa gần nhất để kiểm tra tiền ước tính;
-nếu phiên sau mở cửa tăng khiến tiền không đủ, lệnh bị từ chối khi xử lý.
+đang giữ. Mỗi lệnh mới gọi API market-data DNSE để lấy giá khớp gần nhất; nếu
+không lấy được giá hợp lệ thì bot từ chối lệnh và không dùng Close cũ thay thế.
 
-Lệnh đặt ngày D chờ giá `open` của phiên hợp lệ **sau** ngày D; việc khớp mô
-phỏng chỉ xảy ra khi nến cuối ngày của phiên đó đã được nhập và người dùng mở
-`/paper`, `/paperorders`, `/paperhistory` hoặc gửi lệnh ảo mới. Giá khớp có
-slippage; cập nhật tiền, vị thế và trạng thái lệnh trong một transaction SQLite.
+Lệnh mới khớp ảo ngay tại giá API, sau đó cập nhật tiền, vị thế và lịch sử trong
+một transaction SQLite. Giá, nguồn và thời điểm API được lưu cùng lệnh để kiểm
+tra lại. Tác vụ nền chỉ tiếp tục xử lý các lệnh `PENDING` do phiên bản cũ tạo ra.
+Lệnh ảo vẫn tính phí mua/bán và thuế bán theo `backtest_config.json`; không cộng
+slippage vào giá API hiện hành.
 Lãi/lỗ trên màn hình dùng giá đóng cửa thô gần nhất. Bản MVP chưa tính T+2,
 cổ tức, chia tách, giới hạn giá theo sàn hay độ sâu sổ lệnh; do đó không dùng
 kết quả này như hiệu suất giao dịch thật. Các giới hạn ngành và risk/ATR của
 chiến lược tự động **chưa áp dụng cho lệnh ảo thủ công**; chỉ dùng giới hạn tiền,
 lô và tối đa ba vị thế. Tự đặt lệnh ảo theo tín hiệu chưa được bật.
+Sổ lệnh vẫn giữ tín hiệu, điểm tổng (nếu đủ T/F/M) và ngày tín hiệu tại lúc
+đặt lệnh; các ghi chú cũ được giữ trong SQLite cục bộ, không bị xóa khi bỏ
+hai lệnh nhập ghi chú theo ID. Database không được commit lên Git.
+`/papercapital` thay đổi phần vốn góp mô phỏng và tiền mặt cùng một khoản chênh lệch;
+vẫn bảo vệ tiền đã dành cho lệnh chờ cũ nếu còn. `/paperposition` nhập hoặc sửa
+vị thế có sẵn theo số cổ phiếu và giá vốn tuyệt đối, không tạo lệnh khớp giả;
+giá vốn nhập tay được cộng/trừ vào tổng vốn góp, tiền mặt không đổi. Cả hai
+được lưu lịch sử điều chỉnh trong SQLite và chỉ tác động đến tài khoản chat
+của bạn. Không được sửa vị thế đang có lệnh chờ cùng mã. Biểu đồ `/paper`
+dùng Close cuối cùng đã lưu, không phải giá trị tài sản thời gian thực.
+
+Tổng kết `/digest on` chỉ gửi cho chat riêng tự bật và có danh mục, tối đa một
+lần cho mỗi phiên. Sau `DIGEST_TIME` (mặc định 17:30) ngày giao dịch, bot dùng **phiên trước đó** nếu
+VNINDEX cuối ngày của phiên ấy hợp lệ; tin ghi ngày thật, độ bao phủ và mã chưa
+đủ dữ liệu. Bot thử lại định kỳ nếu dữ liệu đến muộn. `/digest off` dừng nhận;
+mặc định mọi tài khoản đều tắt.
 
 Mock provider có các trường hợp kiểm thử đặc biệt:
 
@@ -168,6 +203,8 @@ Mock provider có các trường hợp kiểm thử đặc biệt:
 ## SQLite
 
 Database tự tạo khi bot khởi động. Ngoài `users`, `watchlist`, `user_settings` và `notifications`, provider chiến lược lưu `market_symbols`, `market_prices`, `market_fundamentals`, `market_indices` và dấu vết import `market_imports` trong cùng SQLite. Khóa chính cho phép import lại mà không nhân đôi dòng. CSV raw trong `crawl data/Project_python3/data` được giữ nguyên khi import; crawler gộp dữ liệu mới vào các CSV này. Bot chuẩn hóa ngày/cột, kiểm tra OHLC và cờ cuối ngày trước khi lưu DB. Với fundamental, CFO và lợi nhuận âm có thể hợp lệ; giá trị âm ở các khoản quy mô tài sản/nợ được gắn cờ riêng. `MODEL READY` không được dùng để phát tín hiệu vì chứa nhãn tương lai.
+Các bảng nhật ký lệnh và tổng kết được tạo khi khởi động; cột nhật ký mới
+được bổ sung vào database cũ mà không xóa lệnh hoặc ghi chú hiện có.
 
 Import lại `cleaned_v2` có sẵn, không cần token Telegram và không gọi mạng:
 
@@ -206,20 +243,30 @@ Unit test không gọi Telegram thật và dùng database tạm.
 
 Đặt `SIGNAL_PROVIDER=strategy` trong `.env`, rồi chạy `python -m app.main`.
 Lần khởi động đầu tiên import `cleaned_v2` vào SQLite. Sau khởi động, tác vụ nền
-kiểm tra và bổ sung dữ liệu cuối ngày của phiên làm việc liền trước; nếu nguồn
+kiểm tra và bổ sung dữ liệu cuối ngày của phiên giao dịch liền trước; nếu nguồn
 lỗi, bot giữ dữ liệu đã lưu và thử lại sau. Không chạy crawl toàn thị trường
 ngay trong lệnh `/scan`.
-`/soi FPT` chỉ cập nhật giá FPT qua DNSE, rồi Vietcap, cuối cùng CafeF khi các nguồn trước lỗi; fundamental
-HSX/HNX vẫn cập nhật từ Vietcap. Dữ liệu được chuẩn hóa, kiểm tra OHLC/đơn vị giá
-và upsert vào DB rồi chấm điểm. `/scan` chỉ dùng VNINDEX đã chốt của ngày làm
-việc liền trước (ví dụ 23/09 dùng 22/09), chỉ đọc SQLite và chấm toàn bộ mã
-đến đúng phiên đó. Nếu phiên kỳ vọng chưa có, bot báo thiếu dữ liệu thay vì
-âm thầm dùng phiên cũ. Cuối tuần lùi về thứ Sáu; lịch nghỉ lễ chưa được tích hợp.
+`/soi FPT` tính T/F/M từ nến và BCTC đã lưu, đồng thời gọi giá DNSE của FPT
+ngay lúc nhận lệnh. Giá mới và tin liên quan có thời hạn chờ riêng; nguồn nào
+chậm/lỗi thì dùng thông tin đã lưu và ghi rõ, không giữ phản hồi vô hạn.
+`/scan` ưu tiên VNINDEX đã chốt của phiên giao dịch liền trước (ví dụ 25/09
+dùng 24/09), chỉ đọc SQLite và chấm toàn bộ mã đến đúng phiên đó. Nếu thiếu
+phiên kỳ vọng, lệnh này thử thêm đúng một phiên giao dịch trước nữa (23/09
+trong ví dụ) và hiển thị cảnh báo cùng ngày dữ liệu thực tế; không dùng dữ liệu
+cũ hơn hoặc trình bày tín hiệu 23/09 như tín hiệu 24/09. Các tác vụ quét tự động
+vẫn đòi đúng phiên kỳ vọng. Lịch nghỉ giao dịch 2026 lấy từ thông báo HNX và HSX,
+bao gồm cập nhật nghỉ 02/01/2026; cần bổ sung lịch năm 2027 trước khi dùng
+trong năm đó. Ngày làm bù thứ Bảy vẫn không phải phiên giao dịch.
+Nguồn: [HNX — lịch nghỉ 2026](https://old.hnx.vn/vi-vn/chi-tiet-lich-nghi-gd-60021971.html?_page=1),
+[HSX — cập nhật Tết Dương lịch 2026](https://staticfile.hsx.vn/Uploads/UploadDocuments/2426350/20251225_Thong%20bao%20%20ve%20%20viec%20cap%20nhat%20lich%20nghi%20giao%20dich%20Tet%20Duong%20lich%202026%20toan%20thi%20truong.pdf).
 Tác vụ EOD tự chạy khi khởi động và kiểm tra lại mỗi giờ; cập nhật giá và chỉ
 số, không crawl lại toàn bộ báo cáo tài chính mỗi giờ. Khi nguồn lỗi, tác vụ
-thử lại sau bốn giờ.
+thử lại sau 15, 30, 60 phút rồi tối đa bốn giờ; `/status` hiển thị trạng thái.
+Mỗi lần thử lưu phiên đích, độ bao phủ, mã còn thiếu và mã tải lỗi vào SQLite;
+chỉ đánh dấu hoàn tất khi VNINDEX hợp lệ và độ bao phủ đạt ngưỡng kiểm tra.
+Lần thử sau bỏ qua mã đã có nến cuối ngày hợp lệ của phiên đích, tránh tải trùng.
 Kết quả `/scan` cùng phiên được giữ trong bộ nhớ tối đa 5 phút để các lệnh lặp
-lại trả nhanh; `/soi` làm mới dữ liệu sẽ xóa cache này.
+lại trả nhanh; `/soi` không crawl lại toàn bộ lịch sử khi người dùng hỏi giá mới.
 
 `/soi <MÃ>` gọi REST DNSE `/price/:symbol/trades/latest` đúng lúc nhận lệnh
 để hiển thị dữ liệu giá mới nhất kèm thời điểm khớp và khối lượng tích lũy;

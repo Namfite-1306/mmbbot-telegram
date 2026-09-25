@@ -97,3 +97,17 @@ def test_settings_rejects_bot_prefix_in_token(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bot123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdef")
     with pytest.raises(ConfigurationError, match="sai định dạng"):
         Settings.from_env(tmp_path / "missing.env")
+
+
+def test_settings_validate_digest_time(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdef")
+    monkeypatch.setenv("DIGEST_TIME", "25:99")
+    with pytest.raises(ConfigurationError, match="DIGEST_TIME"):
+        Settings.from_env(tmp_path / "missing.env")
+    monkeypatch.setenv("DIGEST_TIME", "18:15")
+    assert Settings.from_env(tmp_path / "missing.env").digest_time.strftime("%H:%M") == "18:15"
+    monkeypatch.setenv("ADMIN_CHAT_ID", "not-a-number")
+    with pytest.raises(ConfigurationError, match="ADMIN_CHAT_ID"):
+        Settings.from_env(tmp_path / "missing.env")
+    monkeypatch.setenv("ADMIN_CHAT_ID", "12345")
+    assert Settings.from_env(tmp_path / "missing.env").admin_chat_id == 12345

@@ -4,17 +4,21 @@ import asyncio
 import csv
 from datetime import date, datetime
 from time import monotonic
+from threading import Lock
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from app.market_store import CRAWLER_DIR, MarketStore, previous_weekday
-from app.main import build_application
+from app.main import _eod_refresh_loop, build_application
 from app.config import Settings
 from app.models import SignalStatus
+from app.providers.base import ProviderError
 from app.providers.strategy_signal_provider import StrategySignalProvider
 from app.strategy_engine import VietcapStrategyEngine
+from app.trading_calendar import is_trading_day, previous_trading_day
 
 
 def _write_csv(path, rows):
@@ -23,6 +27,22 @@ def _write_csv(path, rows):
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def test_exchange_holidays_are_not_expected_as_trading_sessions():
+    assert previous_trading_day(date(2026, 1, 5)) == date(2025, 12, 31)
+    assert previous_trading_day(date(2026, 9, 3)) == date(2026, 8, 28)
+    assert previous_trading_day(date(2026, 9, 24)) == date(2026, 9, 23)
+    assert not is_trading_day(date(2026, 8, 22))  # makeup Saturday is not a market session
+
+
+def test_scan_uses_last_trading_day_across_exchange_holiday(tmp_path):
+    store = MarketStore(tmp_path / "holiday.db")
+    store.initialize()
+    with store.connect() as conn:
+        conn.execute("""INSERT INTO market_indices(symbol,trade_date,close,is_final)
+            VALUES('VNINDEX','2026-08-28',1800,1)""")
+    assert store.last_scan_session(date(2026, 9, 3)) == "2026-08-28"
 
 
 def test_import_is_idempotent_and_rejects_invalid_ohlc(tmp_path):
@@ -127,6 +147,37 @@ def test_strategy_scan_uses_previous_session_without_network(tmp_path, monkeypat
     assert asyncio.run(provider.get_market_signals()) == signals
 
 
+def test_manual_scan_falls_back_one_session_only_and_prefers_newer_data(tmp_path):
+    store = MarketStore(tmp_path / "market.db")
+    store.initialize()
+    with store.connect() as conn:
+        conn.execute("""INSERT INTO market_indices(symbol,trade_date,close,is_final)
+            VALUES('VNINDEX','2026-09-23',1800,1)""")
+    provider = StrategySignalProvider(
+        engine=VietcapStrategyEngine(store),
+        now=datetime(2026, 9, 25, 10, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh")))
+    with pytest.raises(ProviderError, match="2026-09-24"):
+        asyncio.run(provider.get_market_signals())
+    assert provider.last_scan_date is None
+
+    asyncio.run(provider.get_market_signals(allow_previous_session=True))
+    assert provider.last_scan_date == "2026-09-23"
+
+    with store.connect() as conn:
+        conn.execute("""INSERT INTO market_indices(symbol,trade_date,close,is_final)
+            VALUES('VNINDEX','2026-09-24',1801,1)""")
+    asyncio.run(provider.get_market_signals(allow_previous_session=True))
+    assert provider.last_scan_date == "2026-09-24"
+
+    with store.connect() as conn:
+        conn.execute("DELETE FROM market_indices WHERE trade_date IN ('2026-09-23','2026-09-24')")
+        conn.execute("""INSERT INTO market_indices(symbol,trade_date,close,is_final)
+            VALUES('VNINDEX','2026-09-22',1799,1)""")
+    with pytest.raises(ProviderError, match="phiên giao dịch liền trước"):
+        asyncio.run(provider.get_market_signals(allow_previous_session=True))
+    assert provider.last_scan_date is None
+
+
 def test_soi_refreshes_only_requested_symbol(monkeypatch):
     calls = []
 
@@ -184,13 +235,47 @@ def test_scan_passes_previous_session_cutoff_to_every_symbol(monkeypatch):
 def test_full_refresh_skips_second_eod_crawl(tmp_path, monkeypatch):
     store = MarketStore(tmp_path / "market.db")
     store.initialize()
-    today = previous_weekday(datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).date()).isoformat()
+    today = previous_trading_day(datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).date()).isoformat()
     with store.connect() as conn:
         conn.execute("INSERT INTO market_refresh_state VALUES('last_full_eod',?)", (today,))
         conn.execute("INSERT INTO market_indices(symbol,trade_date,close,is_final) VALUES('VNINDEX',?,1000,1)", (today,))
+        conn.execute("INSERT INTO market_symbols VALUES('AAA','HSX','STOCK')")
+        conn.execute("""INSERT INTO market_prices(symbol,trade_date,close,volume,is_final)
+            VALUES('AAA',?,100,100,1)""", (today,))
     monkeypatch.setattr("app.market_store.importlib.import_module",
                         lambda name: pytest.fail(f"Unexpected crawler import: {name}"))
     assert "skipped" in store.refresh()
+
+
+def test_eod_completion_requires_index_and_market_coverage(tmp_path):
+    store = MarketStore(tmp_path / "market.db")
+    store.initialize()
+    previous, target = "2026-09-23", "2026-09-24"
+    symbols = [f"A{i}" for i in range(10)]
+    with store.connect() as conn:
+        conn.executemany("INSERT INTO market_symbols VALUES(?,'HSX','STOCK')",
+                         [(symbol,) for symbol in symbols])
+        conn.executemany("""INSERT INTO market_indices(symbol,trade_date,close,is_final)
+            VALUES('VNINDEX',?,1000,1)""", [(previous,), (target,)])
+        conn.executemany("""INSERT INTO market_prices(symbol,trade_date,close,volume,is_final)
+            VALUES(?,?,100,100,1)""",
+            [(symbol, previous) for symbol in symbols[:8]]
+            + [(symbol, target) for symbol in symbols[:6]])
+    status = store.record_eod_attempt(target, source="dnse", failed_symbols=["A9"])
+    assert not status["ready"]
+    assert status["required"] == 8  # 90% of eight valid bars in preceding session.
+    assert status["covered"] == 6 and status["universe"] == 10
+    assert status["failed_symbols"] == ["A9"]
+    assert store.last_eod_refresh_date() is None
+    assert store.last_eod_refresh_status()["missing_symbols"] == symbols[6:]
+
+    with store.connect() as conn:
+        conn.executemany("""INSERT INTO market_prices(symbol,trade_date,close,volume,is_final)
+            VALUES(?,?,100,100,1)""", [(symbol, target) for symbol in symbols[6:8]])
+    status = store.record_eod_attempt(target, source="dnse")
+    assert status["ready"] and status["covered"] == 8
+    assert store.last_eod_refresh_date() == target
+    assert store.record_eod_attempt(target, source="dnse")["covered"] == 8
 
 
 def test_full_refresh_uses_vietcap_backup_when_dnse_preflight_fails(tmp_path, monkeypatch):
@@ -209,6 +294,7 @@ def test_full_refresh_uses_vietcap_backup_when_dnse_preflight_fails(tmp_path, mo
 
     monkeypatch.setattr("app.market_store.DNSEMarketClient", TimedOutClient)
     monkeypatch.setattr(store, "_refresh_vietcap_market", lambda: {"source": "vietcap_backup"})
+    monkeypatch.setattr(store, "_finish_full_refresh", lambda day, report: report)
     assert store.refresh()["source"] == "vietcap_backup"
 
 
@@ -231,6 +317,7 @@ def test_full_refresh_uses_cafef_when_both_primary_sources_fail(tmp_path, monkey
                         lambda: (_ for _ in ()).throw(RuntimeError("VCI timeout")))
     monkeypatch.setattr(store, "_refresh_cafef_market",
                         lambda *args, **kwargs: {"source": "cafef_backup"})
+    monkeypatch.setattr(store, "_finish_full_refresh", lambda day, report: report)
     assert store.refresh()["source"] == "cafef_backup"
 
 
@@ -332,8 +419,8 @@ def test_market_scan_does_not_stop_on_stocks_without_recent_bars(tmp_path, monke
             pass
 
         def get_ohlcv_bars(self, symbol, *args, **kwargs):
-            assert args[1] == previous_weekday(datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).date())
-            return ([{"trade_date": "2026-09-21", "open": 100, "high": 100,
+            assert args[1] == previous_trading_day(datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).date())
+            return ([{"trade_date": args[1].isoformat(), "open": 100, "high": 100,
                       "low": 100, "close": 100, "volume": 1}]
                     if kwargs.get("index") else [])
 
@@ -356,10 +443,11 @@ def test_market_scan_does_not_stop_on_stocks_without_recent_bars(tmp_path, monke
     monkeypatch.setattr(store, "import_directory", lambda *args, **kwargs: {})
     monkeypatch.setattr("app.market_store.importlib.import_module",
                         lambda name: SimpleNamespace(crawl_fundamental_data=lambda *a, **k: {"failed": 0}))
-    result = store.refresh()
-    assert result["already_final"] == 1
-    assert result["empty"] == 5
-    assert result["failed"] == []
+    with pytest.raises(RuntimeError, match="chưa đủ dữ liệu"):
+        store.refresh()
+    status = store.last_eod_refresh_status()
+    assert status["covered"] == 1 and status["universe"] == 6
+    assert store.last_eod_refresh_date() is None
 
 
 def test_cafef_market_backup_skips_empty_symbols_before_valid_one(tmp_path, monkeypatch):
@@ -409,23 +497,80 @@ def test_dnse_price_scale_is_verified_before_upsert(tmp_path, monkeypatch):
                                          "high": 2.1, "low": 1.9, "close": 2.0, "volume": 200}], index=False)
 
 
-def test_startup_task_does_not_use_application_create_task(tmp_path, monkeypatch):
+def test_startup_tasks_wait_until_polling_is_running(tmp_path, monkeypatch):
     class Service:
         async def scan(self):
             return []
 
     runtime = SimpleNamespace(signal_service=Service(), subscriptions=None,
-                              database=None, notifications=None)
+                              database=None,
+                              notifications=SimpleNamespace(send_daily_digest=AsyncMock(return_value=0)))
     settings = Settings(telegram_bot_token="123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrst",
                         signal_provider="strategy", database_path=tmp_path / "bot.db")
     application = build_application(settings, runtime)
     monkeypatch.setattr(type(application), "create_task",
                         lambda *args, **kwargs: pytest.fail("Application.create_task called before start"))
+    monkeypatch.setattr(type(application.bot), "set_my_commands", AsyncMock())
 
     async def scenario():
         await application.post_init(application)
+        await asyncio.sleep(0)
+        assert "startup_scan_task" not in application.bot_data
+        application._running = True
+        await asyncio.wait_for(application.bot_data["background_start_task"], 1)
         await application.bot_data["startup_scan_task"]
         assert application.bot_data["startup_scan_count"] == 0
+        application._running = False
         await application.post_shutdown(application)
+
+    asyncio.run(scenario())
+
+
+def test_eod_health_alerts_once_on_failure_and_on_recovery(monkeypatch):
+    expected = previous_trading_day(datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).date()).isoformat()
+
+    class Store:
+        ready = False
+        attempts = 0
+
+        def last_eod_refresh_date(self):
+            return expected if self.ready else None
+
+        def last_scan_session(self, today):
+            return expected if self.ready else None
+
+        def refresh(self, *, include_fundamentals):
+            assert include_fundamentals is False
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("temporary")
+            self.ready = True
+            return {}
+
+    async def scenario():
+        store = Store()
+        provider = SimpleNamespace(engine=SimpleNamespace(store=store), _refresh_lock=Lock(),
+                                   _scan_revision=0, _scan_cache=None)
+        health = {}
+        messages = []
+
+        async def notify(message):
+            messages.append(message)
+
+        sleeps = 0
+
+        async def stop_after_two_loops(delay):
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps == 2:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr("app.main.asyncio.sleep", stop_after_two_loops)
+        with pytest.raises(asyncio.CancelledError):
+            await _eod_refresh_loop(provider, health, notify)
+        assert store.attempts == 2
+        assert health["state"] == "ready"
+        assert len(messages) == 2
+        assert messages[0].startswith("⚠️") and messages[1].startswith("✅")
 
     asyncio.run(scenario())

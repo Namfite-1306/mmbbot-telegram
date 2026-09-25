@@ -5,18 +5,22 @@ import asyncio
 import logging
 import re
 import sys
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from telegram import Bot, BotCommand, Update
+from telegram import Bot, BotCommand, InputFile, Update
 from telegram.error import InvalidToken, NetworkError, TelegramError
 from telegram.ext import Application, ApplicationBuilder
 
 from app.bot.handlers import BotHandlers
+from app.backtest_v1 import BacktestConfig
 from app.config import ConfigurationError, Settings
-from app.market_store import CLEAN_DIR, MarketStore, previous_weekday
+from app.market_store import BOT_DIR, CLEAN_DIR, MarketStore
+from app.paper_broker import PaperBroker, format_paper_account, render_paper_portfolio
+from app.trading_calendar import previous_trading_day
 from app.providers import MockSignalProvider, SignalProvider, StrategySignalProvider
 from app.providers.base import ProviderError
 from app.strategy_engine import VietcapStrategyEngine
@@ -97,6 +101,7 @@ def build_runtime(settings: Settings) -> Runtime:
         subscriptions,
         notification_repository,
         settings.timezone,
+        settings.digest_time,
     )
     return Runtime(database, signal_service, subscriptions, notifications)
 
@@ -110,30 +115,137 @@ async def _alert_loop(application: Application, runtime: Runtime, interval_secon
         await asyncio.sleep(interval_seconds)
 
 
-async def _eod_refresh_loop(provider: StrategySignalProvider) -> None:
-    """Fill the previous weekday in the background; /scan itself stays network-free."""
+async def _digest_loop(application: Application, runtime: Runtime) -> None:
+    async def sender(chat_id: int, message: str) -> None:
+        await application.bot.send_message(chat_id=chat_id, text=message)
+
+    while True:
+        try:
+            await runtime.notifications.send_daily_digest(sender)
+        except ProviderError as exc:
+            logger.info("Daily digest waits for valid EOD scan: %s", exc)
+        except Exception:
+            logger.exception("Daily digest task failed; will retry")
+        await asyncio.sleep(900)
+
+
+async def _process_paper_orders_once(bot: Bot, broker: PaperBroker) -> None:
+    for chat_id in await asyncio.to_thread(broker.pending_accounts):
+        await asyncio.to_thread(broker.process, chat_id)
+    for event in await asyncio.to_thread(broker.unsent_order_events):
+        if event["status"] == "FILLED":
+            message = (f"✅ Lệnh chờ cũ #{event['order_id']} {event['side']} {event['ticker']} "
+                       f"{event['shares']:,} cp đã khớp mô phỏng theo Open "
+                       f"{event['fill_price']:,.0f} VNĐ ngày {event['fill_date']}. "
+                       "Không phải lệnh khớp tại sàn.\n")
+            snapshot = await asyncio.to_thread(broker.snapshot, event["chat_id"])
+            message += format_paper_account(snapshot)
+        else:
+            message = (f"❌ Lệnh ảo #{event['order_id']} {event['side']} {event['ticker']} "
+                       f"không khớp mô phỏng: {event['note']}")
+        await bot.send_message(chat_id=event["chat_id"], text=message)
+        await asyncio.to_thread(broker.mark_order_event_sent, event["order_id"])
+        if event["status"] == "FILLED":
+            try:
+                chart = (await asyncio.to_thread(render_paper_portfolio, snapshot)).getvalue()
+                await bot.send_photo(
+                    chat_id=event["chat_id"], photo=InputFile(chart, filename="paper_portfolio.png"),
+                    caption="📊 Danh mục ảo sau khớp · định giá theo Close đã lưu.",
+                    write_timeout=30)
+            except (ValueError, ImportError, OSError, TelegramError) as exc:
+                logger.warning("Could not send paper portfolio chart: %s", exc)
+
+
+async def _paper_order_loop(application: Application, database: Database) -> None:
+    """Settle virtual orders once finalized next-session bars arrive and notify owners."""
+    config = await asyncio.to_thread(BacktestConfig.from_json, BOT_DIR / "backtest_config.json")
+    broker = PaperBroker(database, config)
+    while True:
+        try:
+            await _process_paper_orders_once(application.bot, broker)
+        except Exception:
+            logger.exception("Paper order processing failed; will retry")
+        await asyncio.sleep(300)
+
+
+async def _eod_refresh_loop(provider: StrategySignalProvider, health: dict,
+                            notify_admin: Callable[[str], Awaitable[None]] | None = None) -> None:
+    """Fill the previous trading session; /scan itself stays network-free."""
     store = provider.engine.store
+    failures = 0
+    last_target = None
+
+    async def report(message: str) -> None:
+        if notify_admin is None:
+            return
+        try:
+            await notify_admin(message)
+        except Exception:
+            logger.warning("Could not deliver EOD health alert to admin")
+
     while True:
         today = datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).date()
-        expected = previous_weekday(today).isoformat()
+        expected = previous_trading_day(today).isoformat()
+        if expected != last_target:
+            failures = 0
+            last_target = expected
         delay = 3600
         try:
             if store.last_eod_refresh_date() != expected or store.last_scan_session(today) != expected:
+                health.update(state="updating", target=expected,
+                              last_attempt=datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).isoformat(timespec="seconds"))
                 logger.info("Refreshing finalized EOD market data for %s", expected)
 
                 def refresh_locked() -> dict:
                     with provider._refresh_lock:
                         return store.refresh(include_fundamentals=False)
 
-                await asyncio.to_thread(refresh_locked)
+                result = await asyncio.to_thread(refresh_locked)
+                status = result.get("eod_status") or (
+                    store.last_eod_refresh_status()
+                    if hasattr(store, "last_eod_refresh_status") else None)
+                if status and status.get("target") == expected:
+                    health.update(covered=status["covered"], universe=status["universe"],
+                                  required=status["required"],
+                                  missing_symbols=len(status["missing_symbols"]),
+                                  failed_symbols=len(status["failed_symbols"]))
                 if store.last_scan_session(today) != expected or store.last_eod_refresh_date() != expected:
                     raise RuntimeError("Nguồn dự phòng chưa xác nhận đủ phiên cuối ngày")
                 provider._scan_revision += 1
                 provider._scan_cache = None
-                logger.info("EOD market data ready for %s", expected)
+                failures_before_refresh = failures
+                failures = 0
+                health.update(state="ready", target=expected, last_error=None,
+                              last_success=datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).isoformat(timespec="seconds"))
+                logger.info("EOD market data ready for %s: %s/%s stocks", expected,
+                            health.get("covered", "?"), health.get("universe", "?"))
+                if failures_before_refresh:
+                    await report(f"✅ EOD {expected} đã cập nhật lại sau lỗi nguồn dữ liệu. "
+                                 f"Mã có giá hợp lệ: {health.get('covered', '?')}/{health.get('universe', '?')}.")
+            else:
+                failures = 0
+                health.update(state="ready", target=expected, last_error=None)
         except Exception as exc:
             logger.warning("EOD refresh for %s failed; will retry: %s", expected, exc, exc_info=True)
-            delay = 4 * 3600
+            if hasattr(store, "record_eod_attempt"):
+                try:
+                    status = await asyncio.to_thread(
+                        store.record_eod_attempt, expected, error=type(exc).__name__)
+                    health.update(covered=status["covered"], universe=status["universe"],
+                                  required=status["required"],
+                                  missing_symbols=len(status["missing_symbols"]),
+                                  failed_symbols=len(status["failed_symbols"]))
+                except Exception:
+                    logger.exception("Could not record partial EOD refresh status")
+            failures += 1
+            delay = min(4 * 3600, 900 * (2 ** min(failures - 1, 4)))
+            health.update(state="failed", target=expected, last_error=type(exc).__name__,
+                          retry_minutes=delay // 60)
+            if failures == 1:
+                await report(f"⚠️ EOD {expected} chưa cập nhật đầy đủ; bot sẽ tự thử lại. "
+                             f"Mã có giá hợp lệ: {health.get('covered', '?')}/{health.get('universe', '?')}; "
+                             f"cần ít nhất {health.get('required', '?')}. "
+                             f"Loại lỗi: {type(exc).__name__}.")
         await asyncio.sleep(delay)
 
 
@@ -151,14 +263,17 @@ def build_application(settings: Settings, runtime: Runtime | None = None) -> App
                 BotCommand("portfolio", "Xem danh mục quan tâm"),
                 BotCommand("modelportfolio", "Xem danh mục mô phỏng"),
                 BotCommand("paper", "Tài khoản giao dịch ảo"),
-                BotCommand("paperbuy", "Đặt mua cổ phiếu ảo"),
-                BotCommand("papersell", "Đặt bán cổ phiếu ảo"),
-                BotCommand("paperorders", "Xem lệnh ảo đang chờ"),
+                BotCommand("papercapital", "Điều chỉnh vốn ảo"),
+                BotCommand("paperposition", "Nhập vị thế có sẵn"),
+                BotCommand("paperbuy", "Mua ảo ngay theo giá API"),
+                BotCommand("papersell", "Bán ảo ngay theo giá API"),
+                BotCommand("paperorders", "Xem lệnh chờ cũ"),
                 BotCommand("paperhistory", "Lịch sử lệnh ảo"),
-                BotCommand("papercancel", "Hủy lệnh ảo đang chờ"),
+                BotCommand("papercancel", "Hủy lệnh chờ theo ID hoặc mã"),
                 BotCommand("add", "Thêm mã vào danh mục"),
                 BotCommand("remove", "Xóa mã khỏi danh mục"),
                 BotCommand("alert", "Bật hoặc tắt cảnh báo"),
+                BotCommand("digest", "Bật hoặc tắt tổng kết danh mục"),
                 BotCommand("status", "Trạng thái hệ thống"),
                 BotCommand("help", "Hướng dẫn sử dụng"),
             ]
@@ -167,36 +282,56 @@ def build_application(settings: Settings, runtime: Runtime | None = None) -> App
             except TelegramError as exc:
                 logger.warning("Telegram command menu could not be updated: %s", exc)
 
-        application.bot_data["command_menu_task"] = asyncio.create_task(
-            update_command_menu(), name="update-command-menu")
-        if settings.signal_provider == "strategy":
-            async def startup_scan() -> None:
-                try:
-                    signals = await runtime.signal_service.scan()
-                    application.bot_data["startup_scan_count"] = len(signals)
-                    logger.info("Startup market scan evaluated %s symbols", len(signals))
-                except ProviderError as exc:
-                    logger.info("Startup scan waits for EOD data: %s", exc)
-            # post_init runs before Application.start(); manage these background
-            # tasks ourselves instead of calling Application.create_task early.
-            application.bot_data["startup_scan_task"] = asyncio.create_task(
-                startup_scan(), name="startup-market-scan"
-            )
-            provider = getattr(runtime.signal_service, "provider", None)
-            if (isinstance(provider, StrategySignalProvider)
-                    and isinstance(provider.engine, VietcapStrategyEngine)):
-                application.bot_data["eod_refresh_task"] = asyncio.create_task(
-                    _eod_refresh_loop(provider), name="eod-market-refresh"
+        async def start_background_tasks() -> None:
+            # run_polling invokes post_init before deleteWebhook and Application.start().
+            # Do not run market/network jobs until Telegram can receive commands.
+            while not application.running:
+                await asyncio.sleep(0.1)
+            application.bot_data["command_menu_task"] = asyncio.create_task(
+                update_command_menu(), name="update-command-menu")
+            if settings.signal_provider == "strategy":
+                async def startup_scan() -> None:
+                    try:
+                        signals = await runtime.signal_service.scan()
+                        application.bot_data["startup_scan_count"] = len(signals)
+                        logger.info("Startup market scan evaluated %s symbols", len(signals))
+                    except ProviderError as exc:
+                        logger.info("Startup scan waits for EOD data: %s", exc)
+                application.bot_data["startup_scan_task"] = asyncio.create_task(
+                    startup_scan(), name="startup-market-scan"
                 )
-        if settings.enable_mock_alert_scheduler:
-            application.bot_data["mock_alert_task"] = asyncio.create_task(
-                _alert_loop(application, runtime, settings.mock_alert_interval_seconds),
-                name="mock-alert-loop",
-            )
-            logger.info("Mock alert scheduler enabled")
+                provider = getattr(runtime.signal_service, "provider", None)
+                if (isinstance(provider, StrategySignalProvider)
+                        and isinstance(provider.engine, VietcapStrategyEngine)):
+                    application.bot_data["eod_health"] = {"state": "waiting"}
+                    async def notify_admin(message: str) -> None:
+                        await application.bot.send_message(chat_id=settings.admin_chat_id, text=message)
+                    application.bot_data["eod_refresh_task"] = asyncio.create_task(
+                        _eod_refresh_loop(provider, application.bot_data["eod_health"],
+                                          notify_admin if settings.admin_chat_id is not None else None),
+                        name="eod-market-refresh"
+                    )
+            if settings.enable_mock_alert_scheduler:
+                application.bot_data["mock_alert_task"] = asyncio.create_task(
+                    _alert_loop(application, runtime, settings.mock_alert_interval_seconds),
+                    name="mock-alert-loop",
+                )
+                logger.info("Mock alert scheduler enabled")
+            if settings.signal_provider == "strategy":
+                application.bot_data["digest_task"] = asyncio.create_task(
+                    _digest_loop(application, runtime), name="daily-digest-loop"
+                )
+                application.bot_data["paper_order_task"] = asyncio.create_task(
+                    _paper_order_loop(application, runtime.database), name="paper-order-loop"
+                )
+
+        application.bot_data["background_start_task"] = asyncio.create_task(
+            start_background_tasks(), name="start-background-after-polling"
+        )
 
     async def post_shutdown(application: Application) -> None:
-        for key in ("mock_alert_task", "startup_scan_task", "command_menu_task", "eod_refresh_task"):
+        for key in ("background_start_task", "mock_alert_task", "startup_scan_task",
+                    "command_menu_task", "eod_refresh_task", "digest_task", "paper_order_task"):
             task = application.bot_data.get(key)
             if task:
                 task.cancel()
@@ -287,7 +422,7 @@ def main() -> int:
             return 0
         application = build_application(settings)
         logger.info("Starting Telegram polling with provider=%s", settings.signal_provider)
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        application.run_polling(allowed_updates=Update.ALL_TYPES, bootstrap_retries=5)
         return 0
     except ConfigurationError as exc:
         print(f"Configuration error: {exc}")
@@ -299,7 +434,11 @@ def main() -> int:
         )
         return 3
     except NetworkError as exc:
-        print(f"Telegram network error: {redact_secrets(str(exc)) or 'không thể kết nối Telegram'}")
+        print(
+            f"Telegram network error: {redact_secrets(str(exc)) or 'không thể kết nối Telegram'}. "
+            "Không thể nhận /start; kiểm tra kết nối api.telegram.org:443, proxy/VPN/firewall, "
+            "rồi khởi động lại bot."
+        )
         return 4
 
 

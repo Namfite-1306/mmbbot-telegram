@@ -23,6 +23,7 @@ import pandas as pd
 
 from app.cafef_market_data import CafeFDataError, CafeFMarketClient, CafeFNoDataError
 from app.dnse_market_data import DNSEConfigurationError, DNSEDataError, DNSEMarketClient, DNSENoDataError
+from app.trading_calendar import previous_trading_day
 
 
 BOT_DIR = Path(__file__).resolve().parents[1]
@@ -41,7 +42,7 @@ class MarketPriceValidationError(DNSEDataError):
 
 
 def previous_weekday(day: date) -> date:
-    """Conservative EOD cutoff; exchange holidays require a separate calendar."""
+    """Legacy weekday-only helper; live EOD paths use previous_trading_day."""
     day -= timedelta(days=1)
     while day.weekday() >= 5:
         day -= timedelta(days=1)
@@ -289,7 +290,7 @@ class MarketStore:
 
     def last_scan_session(self, before: date) -> str | None:
         """Require the prior weekday's finalized VNINDEX; never silently use older data."""
-        expected = previous_weekday(before).isoformat()
+        expected = previous_trading_day(before).isoformat()
         with self.connect() as conn:
             row = conn.execute("""SELECT trade_date FROM market_indices
                 WHERE symbol='VNINDEX' AND trade_date=? AND is_final=1
@@ -301,6 +302,82 @@ class MarketStore:
             row = conn.execute("SELECT value FROM market_refresh_state WHERE key='last_full_eod'").fetchone()
             return row[0] if row else None
 
+    def eod_refresh_status(self, trade_day: str) -> dict:
+        """Audit a finalized session against the known stock universe.
+
+        A thin session cannot be called complete merely because VNINDEX arrived.
+        Compare with the previous valid index session as well as the universe;
+        legitimately suspended/illiquid shares need not make completion impossible.
+        """
+        with self.connect() as conn:
+            index_ready = conn.execute("""SELECT 1 FROM market_indices WHERE symbol='VNINDEX'
+                AND trade_date=? AND is_final=1 AND quality_flags IS NULL AND close>0""",
+                (trade_day,)).fetchone() is not None
+            universe = [row[0] for row in conn.execute(
+                "SELECT symbol FROM market_symbols WHERE security_type='STOCK' ORDER BY symbol")]
+            covered = {row[0] for row in conn.execute("""SELECT p.symbol FROM market_prices p
+                JOIN market_symbols s ON s.symbol=p.symbol AND s.security_type='STOCK'
+                WHERE p.trade_date=? AND p.is_final=1 AND p.quality_flags IS NULL
+                AND p.close>0 AND p.volume>0""", (trade_day,))}
+            previous = conn.execute("""SELECT MAX(trade_date) FROM market_indices
+                WHERE symbol='VNINDEX' AND trade_date<? AND is_final=1
+                AND quality_flags IS NULL AND close>0""", (trade_day,)).fetchone()[0]
+            previous_covered = 0
+            if previous:
+                previous_covered = conn.execute("""SELECT COUNT(*) FROM market_prices p
+                    JOIN market_symbols s ON s.symbol=p.symbol AND s.security_type='STOCK'
+                    WHERE p.trade_date=? AND p.is_final=1 AND p.quality_flags IS NULL
+                    AND p.close>0 AND p.volume>0""", (previous,)).fetchone()[0]
+        # Half the known universe and 90% of the preceding valid session are
+        # conservative floors, not a guarantee that every listed share traded.
+        required = max(1, math.ceil(len(universe) * 0.5), math.ceil(previous_covered * 0.9))
+        return {"target": trade_day, "index_ready": index_ready,
+                "covered": len(covered), "universe": len(universe),
+                "previous_covered": previous_covered, "required": required,
+                "missing_symbols": [symbol for symbol in universe if symbol not in covered],
+                "ready": index_ready and len(covered) >= required}
+
+    def last_eod_refresh_status(self) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT value FROM market_refresh_state WHERE key='last_eod_attempt'").fetchone()
+        return json.loads(row[0]) if row else None
+
+    def record_eod_attempt(self, trade_day: str, *, source: str = "unknown",
+                           failed_symbols: list[str] | None = None,
+                           error: str | None = None) -> dict:
+        """Persist partial progress so an interrupted refresh can resume safely."""
+        previous = self.last_eod_refresh_status() if failed_symbols is None else None
+        if previous and previous.get("target") == trade_day:
+            failed_symbols = previous.get("failed_symbols", [])
+            if source == "unknown":
+                source = previous.get("source", source)
+        status = self.eod_refresh_status(trade_day)
+        status.update(source=source, failed_symbols=sorted(set(failed_symbols or [])),
+                      attempted_at=datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).isoformat(timespec="seconds"),
+                      error=error)
+        if error:
+            status["ready"] = False
+        with self.connect() as conn:
+            conn.execute("""INSERT INTO market_refresh_state(key,value) VALUES('last_eod_attempt',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (json.dumps(status, ensure_ascii=False),))
+            if status["ready"]:
+                conn.execute("""INSERT INTO market_refresh_state(key,value) VALUES('last_full_eod',?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (trade_day,))
+        return status
+
+    def _finish_full_refresh(self, trade_day: date, report: dict) -> dict:
+        failed = report.get("failed", [])
+        status = self.record_eod_attempt(trade_day.isoformat(),
+                                         source=report.get("source", "dnse"),
+                                         failed_symbols=failed if isinstance(failed, list) else [])
+        report["eod_status"] = status
+        if not status["ready"]:
+            raise RuntimeError(
+                f"EOD {trade_day} chưa đủ dữ liệu: {status['covered']}/{status['universe']} mã "
+                f"(cần >= {status['required']}), VNINDEX hợp lệ={status['index_ready']}")
+        return report
+
     def latest_price_dates_through(self, trade_day: str) -> dict[str, str]:
         """One database query to classify missing/stale symbols before a scan."""
         with self.connect() as conn:
@@ -311,12 +388,23 @@ class MarketStore:
 
     def latest_coverage(self) -> tuple[str, int, int]:
         today = datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).date()
-        trade_day = self.last_scan_session(today) or previous_weekday(today).isoformat()
+        trade_day = self.last_scan_session(today) or previous_trading_day(today).isoformat()
         with self.connect() as conn:
             covered = conn.execute("""SELECT COUNT(*) FROM market_prices
                 WHERE trade_date=? AND is_final=1 AND quality_flags IS NULL AND volume>0""", (trade_day,)).fetchone()[0]
             universe = conn.execute("SELECT COUNT(*) FROM market_symbols WHERE security_type='STOCK'").fetchone()[0]
         return trade_day, covered, universe
+
+    def session_coverage(self, trade_day: str) -> tuple[int, int]:
+        """Count valid final stock bars and known stocks for one scan session."""
+        with self.connect() as conn:
+            covered = conn.execute("""SELECT COUNT(*) FROM market_prices p
+                JOIN market_symbols s ON s.symbol=p.symbol AND s.security_type='STOCK'
+                WHERE p.trade_date=? AND p.is_final=1 AND p.quality_flags IS NULL
+                AND p.close>0 AND p.volume>0""", (trade_day,)).fetchone()[0]
+            universe = conn.execute(
+                "SELECT COUNT(*) FROM market_symbols WHERE security_type='STOCK'").fetchone()[0]
+        return covered, universe
 
     def breadth(self, trade_day: str | None = None) -> tuple[int, int]:
         """HOSE common-stock advancers with valid trades on both index sessions."""
@@ -346,11 +434,11 @@ class MarketStore:
         if str(CRAWLER_DIR) not in sys.path:
             sys.path.insert(0, str(CRAWLER_DIR))
         now = datetime.now(ZoneInfo("Asia/Ho_Chi_Minh"))
-        target_day = previous_weekday(now.date()) if symbol is None else now.date()
+        target_day = previous_trading_day(now.date()) if symbol is None else now.date()
         if symbol is None:
             with self.connect() as conn:
                 row = conn.execute("SELECT value FROM market_refresh_state WHERE key='last_full_eod'").fetchone()
-            if row and row[0] == target_day.isoformat() and self.last_scan_session(now.date()):
+            if row and row[0] == target_day.isoformat() and self.eod_refresh_status(target_day.isoformat())["ready"]:
                 return {"skipped": f"Dữ liệu cuối ngày {target_day} đã được cập nhật"}
         try:
             dnse = DNSEMarketClient(BOT_DIR / ".env")
@@ -365,7 +453,8 @@ class MarketStore:
         if symbol is None:
             with self.connect() as conn:
                 completed = {row[0] for row in conn.execute("""SELECT symbol FROM market_prices
-                    WHERE trade_date=? AND is_final=1 AND quality_flags IS NULL""",
+                    WHERE trade_date=? AND is_final=1 AND quality_flags IS NULL
+                    AND close>0 AND volume>0""",
                     (target_day.isoformat(),))}
             already_final = len(completed)
             targets = [ticker for ticker in targets if ticker not in completed]
@@ -373,13 +462,15 @@ class MarketStore:
         # Vietcap pipeline has its own circuit breaker and preserves cached data.
         if symbol is None:
             try:
-                if not dnse.get_ohlcv_bars("VNINDEX", start, end, index=True):
-                    raise DNSEDataError("DNSE chưa có nến VNINDEX trong 7 ngày qua")
+                index_bars = dnse.get_ohlcv_bars("VNINDEX", start, end, index=True)
+                if not any(bar["trade_date"] == target_day.isoformat() for bar in index_bars):
+                    raise DNSEDataError(f"DNSE chưa có nến VNINDEX cho {target_day}")
             except DNSEConfigurationError as exc:
                 raise RuntimeError(str(exc)) from exc
             except DNSEDataError as exc:
                 LOG.warning("DNSE preflight failed; using Vietcap backup: %s", exc)
-                return self._refresh_vietcap_or_cafef_market(start, end)
+                return self._finish_full_refresh(target_day,
+                                                 self._refresh_vietcap_or_cafef_market(start, end))
         success = fallback = cafef_fallback = empty = failed = consecutive_dnse_failures = 0
         errors = []
         for ticker in targets:
@@ -420,13 +511,15 @@ class MarketStore:
                         errors.append(ticker)
             if symbol is None and consecutive_dnse_failures >= 5:
                 LOG.warning("DNSE failed for five consecutive symbols; switching to market backups")
-                return self._refresh_vietcap_or_cafef_market(start, end)
+                return self._finish_full_refresh(target_day,
+                                                 self._refresh_vietcap_or_cafef_market(start, end))
             sleep(0.1)
         if symbol is None:
             index_failed = False
             for index_symbol in ("VNINDEX", "HNXINDEX", "UPCOMINDEX"):
                 try:
-                    bars = dnse.get_ohlcv_bars(index_symbol, start, end, index=True)
+                    bars = (index_bars if index_symbol == "VNINDEX"
+                            else dnse.get_ohlcv_bars(index_symbol, start, end, index=True))
                     if bars:
                         self._save_dnse_bars(index_symbol, bars, index=True)
                     elif index_symbol == "VNINDEX":
@@ -453,20 +546,18 @@ class MarketStore:
             finally:
                 imported = self.import_directory(RAW_DIR, [symbol])
             index_failed = False
-        if failed or index_failed or (symbol is not None and empty) or (fundamental_result and fundamental_result.get("failed")):
+        if symbol is not None and (failed or empty or (fundamental_result and fundamental_result.get("failed"))):
             raise RuntimeError(f"Cập nhật chưa đủ: {failed} mã giá lỗi, "
                                f"{empty} mã không có phiên mới, "
                                f"{(fundamental_result or {}).get('failed', 0)} mã fundamental lỗi, "
                                f"index lỗi={index_failed}")
-        if symbol is None and self.last_scan_session(now.date()) != target_day.isoformat():
-            raise RuntimeError(f"Chưa có VNINDEX cuối ngày hợp lệ cho {target_day}; không xác nhận cập nhật EOD")
-        if symbol is None:
-            with self.connect() as conn:
-                conn.execute("""INSERT INTO market_refresh_state(key,value) VALUES('last_full_eod',?)
-                    ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (target_day.isoformat(),))
-        return {"dnse": success, "vietcap_backup": fallback, "cafef_backup": cafef_fallback,
+        report = {"dnse": success, "vietcap_backup": fallback, "cafef_backup": cafef_fallback,
                 "already_final": already_final, "empty": empty,
                 "failed": errors, "fundamental": fundamental_result, "imported": imported}
+        if symbol is None:
+            report["index_failed"] = index_failed
+            return self._finish_full_refresh(target_day, report)
+        return report
 
     def _save_dnse_bars(self, symbol: str, bars: list[dict], *, index: bool,
                         source: str = "dnse") -> int:
@@ -616,7 +707,7 @@ class MarketStore:
 
     def _refresh_vietcap_market(self) -> dict:
         pipeline = importlib.import_module("daily_data_pipeline")
-        target_day = previous_weekday(datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).date())
+        target_day = previous_trading_day(datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).date())
         try:
             report = pipeline.run_pipeline("update", date(2020, 1, 1), 7, 2, 0.8, True,
                                            end_date=target_day)
@@ -627,9 +718,4 @@ class MarketStore:
             failures += report["fundamental"]["failed"]
         if failures:
             raise RuntimeError(f"Vietcap backup cập nhật thiếu {failures} phần; dữ liệu cũ được giữ lại")
-        if self.last_scan_session(datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).date()) != target_day.isoformat():
-            raise RuntimeError(f"Vietcap chưa có VNINDEX cuối ngày hợp lệ cho {target_day}")
-        with self.connect() as conn:
-            conn.execute("""INSERT INTO market_refresh_state(key,value) VALUES('last_full_eod',?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (target_day.isoformat(),))
         return {"source": "vietcap_backup", "crawl": report, "imported": imported}

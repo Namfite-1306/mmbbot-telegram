@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 import pytest
 import pandas as pd
 
-from app.bot.formatter import format_stock_overview, format_watchlist
+from app.bot.formatter import format_scan, format_status, format_stock_overview, format_watchlist
 from app.cafef_news import NewsItem, _CompanyNewsParser
 from app.market_store import MarketStore
 from app.models import Action, Signal, SignalStatus
@@ -43,10 +43,12 @@ def test_formatter_does_not_mislabel_technical_score_as_total() -> None:
                     timestamp, "v1", "1D", SignalStatus.WATCH_ONLY,
                     {"T": 100, "F": None, "M": 40})
     text = format_stock_overview(signal, {}, [])
-    assert "Chưa có điểm tổng" in text
-    assert "Tổng (37,5%" not in text
+    assert "Điểm: chưa tính được." in text
+    assert "T: 100/100" not in text and "F: chưa có" not in text and "M: 40/100" not in text
+    assert "37,5%" not in text and "31,25%" not in text
     assert text.startswith("🟡 TÍN HIỆU: THEO DÕI")
     assert "Tin liên quan" not in text
+    assert "Thiếu ngành" in text
 
 
 def test_overview_shows_two_news_titles_and_links() -> None:
@@ -75,6 +77,77 @@ def test_old_dnse_match_shows_timestamp_without_realtime_claim() -> None:
     assert "khớp gần nhất" not in text
     assert "Thời điểm dữ liệu: 15:00:00 21/09/2026" in text
     assert "11.000 VNĐ" in text
+
+
+def test_overview_explains_score_gate_and_observed_price_source() -> None:
+    timestamp = datetime(2026, 9, 21, 15, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
+    signal = Signal("x", "AAA", None, 10000, 70,
+                    ["T=70/100; E=NO_ENTRY", "Market regime: BEAR"],
+                    timestamp, timestamp, "v1", "1D", SignalStatus.WATCH_ONLY,
+                    {"T": 70, "F": 70, "M": 70})
+    text = format_stock_overview(signal, {"quote": {"trade_date": "2026-09-21",
+                                                "close": 10000, "is_final": 1,
+                                                "source": "dnse"}}, [])
+    assert "Nguồn giá lưu: DNSE · ngày 2026-09-21" in text
+    assert "Điểm: 70,0/100" in text
+    assert "T: 70/100" not in text and "F: 70/100" not in text and "M: 70/100" not in text
+    assert "Điểm tổng còn 5.0 điểm" in text
+    assert "Cổng vào lệnh hiện là NO_ENTRY" in text
+    assert "Trạng thái thị trường hiện là BEAR" in text
+
+
+def test_scan_shows_session_without_coverage_and_status_shows_eod_health() -> None:
+    stamp = datetime(2026, 9, 23, 15, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
+    signal = Signal("x", "AAA", Action.BUY, 10000, 80, [], stamp, stamp,
+                    "v1", "1D", SignalStatus.SUCCESS,
+                    {"T": 80, "F": 80, "M": 80})
+    scan = format_scan([signal], "Asia/Ho_Chi_Minh", scan_date="2026-09-23",
+                       coverage=(870, 1523), expected_scan_date="2026-09-24")
+    assert "đang dùng dữ liệu phiên 2026-09-23" in scan
+    assert "không phải tín hiệu của 2026-09-24" in scan
+    assert "Phiên dữ liệu: 2026-09-23\n" in scan
+    assert "870/1523" not in scan
+    assert "không được coi là tín hiệu BÁN" not in scan
+    assert "đã lưu; /scan không crawl" not in scan
+    current_scan = format_scan([signal], "Asia/Ho_Chi_Minh", scan_date="2026-09-24",
+                               expected_scan_date="2026-09-24")
+    assert "đang dùng dữ liệu phiên" not in current_scan
+    unavailable = Signal("x", "BBB", None, 0, 0, [], stamp, stamp,
+                         "v1", "1D", SignalStatus.INSUFFICIENT_DATA)
+    scan_with_missing = format_scan([signal, unavailable], "Asia/Ho_Chi_Minh",
+                                    scan_date="2026-09-24")
+    assert "Không lấy được dữ liệu đúng phiên cho: BBB" in scan_with_missing
+    status = format_status("strategy", True, stamp, "2026-09-23",
+                           None, "2026-09-23", {"state": "failed", "retry_minutes": 15,
+                                                "target": "2026-09-23", "covered": 870,
+                                                "universe": 1523, "required": 1000,
+                                                "failed_symbols": 3, "missing_symbols": 653})
+    assert "Cập nhật toàn thị trường đã xác nhận: chưa có" in status
+    assert "Mã đã lưu hợp lệ: 870/1523; cần ít nhất 1000" in status
+    assert "Mã tải lỗi: 3" in status and "Mã còn thiếu: 653" in status
+    assert "thử lại sau khoảng 15 phút" in status
+
+
+def test_vn100_scan_shows_only_movers_ranked_by_total_score() -> None:
+    stamp = datetime(2026, 9, 24, 15, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
+
+    def signal(ticker: str, score: float, change: float) -> Signal:
+        return Signal(ticker, ticker, None, 10_000, score, [], stamp, stamp,
+                      "v1", "1D", SignalStatus.WATCH_ONLY,
+                      {"T": score, "F": score, "M": score}, change)
+
+    text = format_scan([
+        signal("ACB", 90, 2.5),
+        signal("FPT", 40, -1.25),
+        signal("HPG", 70, 0.75),
+    ], "Asia/Ho_Chi_Minh", scan_date="2026-09-24", vn100_mode=True)
+
+    assert "VN100 — 3 mã tính được điểm" in text
+    assert "T/F/M" not in text
+    assert "Đang tăng: 2 | 🔴 Đang giảm: 1" in text
+    assert text.index("ACB: +2.50% · 90.00/100") < text.index("HPG: +0.75% · 70.00/100")
+    assert "FPT: -1.25% · 40.00/100" in text
+    assert "Điểm thấp nhất" in text
 
 
 def test_portfolio_traffic_lights_price_change_and_navigation() -> None:

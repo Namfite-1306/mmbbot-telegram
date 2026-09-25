@@ -41,3 +41,17 @@ class SubscriptionService:
     async def alert_subscribers(self) -> list[int]:
         return await asyncio.to_thread(self.settings.alert_subscribers)
 
+    async def set_digest(self, chat_id: int, enabled: bool) -> None:
+        await asyncio.to_thread(self.settings.set_digest, chat_id, enabled)
+
+    async def digest_enabled(self, chat_id: int) -> bool:
+        return await asyncio.to_thread(self.settings.digest_enabled, chat_id)
+
+    async def digest_subscribers(self) -> list[int]:
+        return await asyncio.to_thread(self.settings.digest_subscribers)
+
+    async def digest_was_sent(self, chat_id: int, session: str) -> bool:
+        return await asyncio.to_thread(self.settings.digest_was_sent, chat_id, session)
+
+    async def record_digest_sent(self, chat_id: int, session: str) -> bool:
+        return await asyncio.to_thread(self.settings.record_digest_sent, chat_id, session)

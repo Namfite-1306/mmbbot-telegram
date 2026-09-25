@@ -22,19 +22,38 @@ def _format_time(value: datetime, timezone_name: str) -> str:
 def _score_label(signal: Signal) -> str:
     components = signal.score_components
     if components and any(components.get(key) is None for key in ("T", "F", "M")):
-        return f"T kỹ thuật {signal.score:.0f}/100 (chưa có điểm tổng)"
+        return "chưa tính được"
     return f"{signal.score:.0f}/100"
+
+
+def _public_reasons(reasons: list[str]) -> list[str]:
+    """Hide internal score components while retaining useful data warnings."""
+    public: list[str] = []
+    for reason in reasons:
+        if reason.startswith("T="):
+            continue
+        if reason.startswith("Chưa có điểm tổng T/F/M"):
+            item = "Chưa đủ dữ liệu đầu vào để tính điểm."
+        elif reason.startswith(("F chưa tính được:", "M chưa tính được:")):
+            item = "Chưa tính được điểm: " + reason.partition(":")[2].strip()
+        elif reason.startswith("Điểm đạt 75 nhưng"):
+            item = "Điểm đạt ngưỡng nhưng điều kiện vào lệnh hoặc dữ liệu chưa hợp lệ."
+        else:
+            item = reason
+        if item not in public:
+            public.append(item)
+    return public
 
 
 def format_signal(signal: Signal, timezone_name: str = "Asia/Ho_Chi_Minh") -> str:
     if signal.status is SignalStatus.INSUFFICIENT_DATA:
-        details = "\n".join(f"• {reason}" for reason in signal.reasons)
+        details = "\n".join(f"• {reason}" for reason in _public_reasons(signal.reasons))
         return f"🔴 {signal.ticker} — Không đủ dữ liệu\n\n{details}\n\n{DISCLAIMER}"
     if signal.status is SignalStatus.STALE_DATA:
-        details = "\n".join(f"• {reason}" for reason in signal.reasons)
+        details = "\n".join(f"• {reason}" for reason in _public_reasons(signal.reasons))
         return f"🔴 {signal.ticker} — Dữ liệu đã cũ; điểm tham khảo {_score_label(signal)}\nDữ liệu: {_format_time(signal.data_time, timezone_name)}\n\n{details}\n\n{DISCLAIMER}"
     if signal.status is SignalStatus.WATCH_ONLY:
-        details = "\n".join(f"• {reason}" for reason in signal.reasons)
+        details = "\n".join(f"• {reason}" for reason in _public_reasons(signal.reasons))
         price = f"{signal.price:,.0f}".replace(",", ".") if signal.price > 0 else "không có"
         return (f"🟡 {signal.ticker} — Theo dõi, chưa phát lệnh\n"
                 f"Giá đóng cửa: {price} VNĐ\nĐiểm tham khảo: {_score_label(signal)}\n"
@@ -43,7 +62,7 @@ def format_signal(signal: Signal, timezone_name: str = "Asia/Ho_Chi_Minh") -> st
         return f"🔴 {signal.ticker} — Lỗi dữ liệu\n\nVui lòng thử lại sau."
 
     icon = ACTION_ICON[signal.action]
-    reasons = "\n".join(f"• {reason}" for reason in signal.reasons)
+    reasons = "\n".join(f"• {reason}" for reason in _public_reasons(signal.reasons))
     formatted_price = f"{signal.price:,.0f}".replace(",", ".")
     return (
         f"{icon} {signal.ticker} — {signal.action.value}\n\n"
@@ -59,10 +78,13 @@ def format_signal(signal: Signal, timezone_name: str = "Asia/Ho_Chi_Minh") -> st
 
 def format_lookup_error(ticker: str, error_code: str) -> str:
     if error_code == "not_found":
-        return f"Không tìm thấy mã {ticker} trong nguồn dữ liệu hiện tại."
+        return (f"Không lấy được dữ liệu cho mã {ticker}: "
+                "không tìm thấy trong nguồn dữ liệu hiện tại.")
     if error_code == "invalid_signal":
-        return f"⚠️ Signal của {ticker} không hợp lệ. Vui lòng thử lại sau."
-    return f"⚠️ Không thể lấy signal cho {ticker}. Vui lòng thử lại sau."
+        return (f"⚠️ Không lấy được dữ liệu cho mã {ticker}: "
+                "signal không hợp lệ. Vui lòng thử lại sau.")
+    return (f"⚠️ Không lấy được dữ liệu cho mã {ticker}. "
+            "Vui lòng thử lại sau.")
 
 
 def format_lookup_results(results: list[SignalLookup], timezone_name: str) -> str:
@@ -99,6 +121,42 @@ def _percent_ratio(value: object) -> str:
         return "chưa có"
 
 
+def _decision_explanation(signal: Signal) -> str:
+    if signal.status in {SignalStatus.STALE_DATA, SignalStatus.INSUFFICIENT_DATA,
+                         SignalStatus.PROVIDER_ERROR}:
+        return "Cần dữ liệu hợp lệ đúng phiên trước khi đánh giá điều kiện mua."
+    if signal.action is Action.BUY:
+        return "Đã qua các cổng BUY của chiến lược tại giá đóng cửa; không phải lệnh khớp thực tế."
+    if signal.action is Action.SELL:
+        return "Điều kiện thoát vị thế được xác nhận tại giá đóng cửa."
+    notes: list[str] = []
+    components = signal.score_components or {}
+    if components and any(components.get(key) is None for key in ("T", "F", "M")):
+        notes.append("Chưa đủ dữ liệu đầu vào để tính điểm")
+    elif signal.score < 75:
+        notes.append(f"Điểm tổng còn {75 - signal.score:.1f} điểm để chạm ngưỡng 75")
+    for reason in signal.reasons:
+        if reason.startswith("Cổng vào lệnh: "):
+            entry = reason.partition(": ")[2].split()[0]
+            if entry != "ENTRY":
+                notes.append(f"Cổng vào lệnh hiện là {entry}")
+            break
+        if "; E=" in reason:
+            entry = reason.split("; E=", 1)[1].split()[0]
+            if entry != "ENTRY":
+                notes.append(f"Cổng vào lệnh hiện là {entry}")
+            break
+    for reason in signal.reasons:
+        if reason.startswith("Market regime: "):
+            regime = reason.partition(": ")[2]
+            if regime not in {"BULL", "NEUTRAL"}:
+                notes.append(f"Trạng thái thị trường hiện là {regime}")
+            break
+    if not notes:
+        notes.append("Chưa qua đủ cổng BUY; xem lý do chiến lược bên dưới")
+    return "; ".join(notes[:3]) + "."
+
+
 def format_stock_overview(signal: Signal, overview: dict, news: list[NewsItem],
                           live_trade: dict | None = None) -> str:
     quote = overview.get("quote") or {}
@@ -120,11 +178,12 @@ def format_stock_overview(signal: Signal, overview: dict, news: list[NewsItem],
         lines.extend(["", "⚡ Dữ liệu mới nhất",
                       f"Giá: {_metric(live_trade['price_vnd'], 0)} VNĐ"
                       + (f" ({change:+.2f}% so với đóng cửa phiên trước)" if change is not None else ""),
-                      f"Thời điểm dữ liệu: {moment:%H:%M:%S %d/%m/%Y}"])
+                      f"Thời điểm dữ liệu: {moment:%H:%M:%S %d/%m/%Y}",
+                      f"Nguồn giá mới: {live_trade.get('source', 'DNSE')}"])
         if "total_volume" in live_trade:
             lines.append(f"Khối lượng tích lũy: {_metric(live_trade['total_volume'], 0)} cp")
     else:
-        lines.extend(["", "Giá real-time chưa có; dùng dữ liệu đã lưu."])
+        lines.extend(["", "Chưa có giá mới hơn từ DNSE; dùng dữ liệu đã lưu."])
     lines.extend(["", f"📊 Phiên đã lưu {date_label}"
              + (" (tạm tính)" if quote and not quote.get("is_final") else "")])
     if quote:
@@ -138,6 +197,8 @@ def format_stock_overview(signal: Signal, overview: dict, news: list[NewsItem],
         ])
     else:
         lines.append("Chưa có giá hợp lệ trong kho dữ liệu.")
+    if quote and quote.get("source"):
+        lines.append(f"Nguồn giá lưu: {str(quote['source']).upper()} · ngày {date_label}")
     lines.extend(["", "💰 Tài chính cơ bản"])
     if financial:
         period = financial.get("report_period") or "không rõ kỳ"
@@ -154,21 +215,17 @@ def format_stock_overview(signal: Signal, overview: dict, news: list[NewsItem],
         lines.append("Chưa có BCTC đã công bố trước ngày phân tích.")
     lines.extend(["", f"🎯 Điểm (phiên {signal.data_time:%d/%m/%Y})"])
     components = signal.score_components or {}
-    if components:
-        lines.append("T: " + _metric(components.get("T"), 0) + "/100 · F: "
-                     + _metric(components.get("F"), 0) + "/100 · M: "
-                     + _metric(components.get("M"), 0) + "/100")
-        if all(components.get(key) is not None for key in ("T", "F", "M")):
-            lines.append(f"Tổng (37,5% T + 31,25% F + 31,25% M): {_metric(signal.score, 1)}/100")
-        else:
-            lines.append("Chưa có điểm tổng; không dùng điểm T thay cho T/F/M.")
+    if not components or all(components.get(key) is not None for key in ("T", "F", "M")):
+        lines.append(f"Điểm: {_metric(signal.score, 1)}/100")
     else:
-        lines.append("Chưa tính được điểm T/F/M.")
-    if signal.reasons:
-        lines.append("Lý do: " + "; ".join(signal.reasons[:3]))
-    risks = [reason for reason in signal.reasons if any(term in reason.lower() for term in
+        lines.append("Điểm: chưa tính được.")
+    lines.append("Điều kiện tiếp theo: " + _decision_explanation(signal))
+    public_reasons = _public_reasons(signal.reasons)
+    if public_reasons:
+        lines.append("Lý do: " + "; ".join(public_reasons[:3]))
+    risks = [reason for reason in public_reasons if any(term in reason.lower() for term in
              ("thiếu", "chưa có", "chưa tính", "cũ", "không làm mới", "unknown", "giá thô", "upcom"))]
-    extra_risks = [reason for reason in risks if reason not in signal.reasons[:3]]
+    extra_risks = [reason for reason in risks if reason not in public_reasons[:3]]
     if extra_risks:
         lines.extend(["", "⚠️ Cần chú ý"])
         lines.extend(f"• {reason}" for reason in extra_risks[:2])
@@ -182,7 +239,24 @@ def format_stock_overview(signal: Signal, overview: dict, news: list[NewsItem],
 
 
 def format_usage(command: str, example: str) -> str:
-    return f"Cú pháp: /{command} {example}"
+    examples = {
+        "soi": "/soi FPT",
+        "analyze": "/analyze FPT",
+        "chart": "/chart FPT",
+        "add": "/add FPT HPG",
+        "remove": "/remove FPT",
+        "papercapital": "/papercapital 100000000",
+        "paperposition": "/paperposition FPT 100 85000",
+        "paperbuy": "/paperbuy FPT 100",
+        "papersell": "/papersell FPT 100",
+        "papercancel": "/papercancel 12 hoặc /papercancel FPT",
+        "alert": "/alert on",
+        "digest": "/digest on",
+    }
+    syntax = f"/{command} {example}".strip()
+    sample = examples.get(command)
+    return (f"Lệnh chưa đúng hoặc còn thiếu thông tin.\nCú pháp đúng: {syntax}"
+            + (f"\nVí dụ: {sample}" if sample else ""))
 
 
 def format_plain_text_help() -> str:
@@ -201,15 +275,16 @@ def format_alert_state(enabled: bool) -> str:
 
 def format_start() -> str:
     return (
-        "Chào bạn, tôi là nhà tư vấn chiến lược Mr. Mission Bossible bot. Tôi có thể giúp gì cho bạn.\n\n"
-        "• /analyze <MÃ> (hoặc /soi <MÃ>) — xem một mã\n"
-        "• /scan — quét BUY/SELL\n"
-        "• /add <MÃ> <MÃ> — thêm vào danh mục\n"
-        "• /portfolio — xem danh mục\n"
-        "• /modelportfolio — xem danh mục mô phỏng theo vốn cấu hình\n"
-        "• /paper — tài khoản giao dịch ảo, lệnh và vị thế\n"
-        "• /chart <MÃ> — xem biểu đồ\n"
-        "• /help — hướng dẫn đầy đủ\n\n"
+        "👋 Chào bạn, tôi là nhà tư vấn chiến lược Mr. Mission Bossible bot. Tôi có thể giúp gì cho bạn.\n\n"
+        "🔎 /analyze <MÃ> (hoặc /soi <MÃ>) — xem một mã\n"
+        "📡 /scan — xem top điểm cao/thấp trong VN100\n"
+        "➕ /add <MÃ> <MÃ> — thêm vào danh mục\n"
+        "💼 /portfolio — xem danh mục\n"
+        "📊 /modelportfolio — xem danh mục mô phỏng theo vốn cấu hình\n"
+        "🎮 /paper — tài khoản giao dịch ảo, lệnh và vị thế\n"
+        "🔔 /digest on — tổng kết danh mục theo phiên (tự chọn bật)\n"
+        "📈 /chart <MÃ> — xem biểu đồ\n"
+        "❓ /help — hướng dẫn đầy đủ\n\n"
         f"{DISCLAIMER}"
     )
 
@@ -219,17 +294,20 @@ def format_help() -> str:
         "Hướng dẫn sử dụng\n\n"
         "/analyze <MÃ> (hoặc /soi <MÃ>) — xem phân tích một mã\n"
         "/chart <MÃ> — xem biểu đồ một năm\n"
-        "/scan — xem các signal BUY/SELL\n"
+        "/scan — xem top điểm cao/thấp trong các mã VN100 tăng hoặc giảm\n"
         "/add <MÃ> <MÃ> — thêm tối đa 10 mã\n"
         "/remove <MÃ> <MÃ> — xóa mã\n"
         "/portfolio — xem tổng quan danh mục\n"
-        "/modelportfolio — xem phân bổ vốn mô phỏng từ tín hiệu cuối ngày\n"
+        "/modelportfolio (hoặc /phanbo) — xem phân bổ vốn mô phỏng từ tín hiệu cuối ngày\n"
         "/paper — xem tiền mặt, vị thế và tài sản ảo\n"
-        "/paperbuy <MÃ> <SỐ_CP> — xếp lệnh mua ảo (lô 100)\n"
-        "/papersell <MÃ> <SỐ_CP> — xếp lệnh bán ảo\n"
-        "/paperorders — lệnh ảo đang chờ; /paperhistory — lịch sử\n"
-        "/papercancel <ID> — hủy lệnh ảo đang chờ\n"
+        "/papercapital <VỐN_VNĐ> — đặt lại vốn góp ảo; chênh lệch cộng/trừ tiền mặt\n"
+        "/paperposition <MÃ> <SỐ_CP> <GIÁ_VỐN_VNĐ> — nhập/chỉnh vị thế có sẵn; 0 0 để xóa\n"
+        "/paperbuy <MÃ> <SỐ_CP> (hoặc /buy, /mua) — mua ảo ngay theo giá API (lô 100)\n"
+        "/papersell <MÃ> <SỐ_CP> (hoặc /sell, /ban) — bán ảo ngay theo giá API\n"
+        "/paperorders — lệnh chờ cũ; /paperhistory — lịch sử\n"
+        "/papercancel <ID hoặc MÃ> — hủy một lệnh hoặc mọi lệnh chờ của mã\n"
         "/alert on|off — bật hoặc tắt cảnh báo\n"
+        "/digest on|off — bật hoặc tắt tổng kết danh mục cuối ngày (mặc định tắt)\n"
         "/status — trạng thái hệ thống\n\n"
         "Bạn cũng có thể gửi trực tiếp một hoặc nhiều mã cổ phiếu.\n\n"
         f"{DISCLAIMER}"
@@ -238,9 +316,41 @@ def format_help() -> str:
 
 def format_scan(signals: list[Signal], timezone_name: str,
                 breadth: tuple[int, int] | None = None, refresh_error: str | None = None,
-                scan_date: str | None = None) -> str:
+                scan_date: str | None = None,
+                coverage: tuple[int, int] | None = None,
+                expected_scan_date: str | None = None,
+                vn100_mode: bool = False) -> str:
     if not signals:
-        return "Chưa có kết quả quét. Kiểm tra dữ liệu phiên trước trong database bằng /status."
+        message = ("Chưa có mã VN100 nào vừa tính được điểm vừa tăng hoặc giảm trong phiên."
+                   if vn100_mode else
+                   "Chưa có kết quả quét. Kiểm tra dữ liệu phiên trước trong database bằng /status.")
+        if scan_date and expected_scan_date and scan_date != expected_scan_date:
+            return (f"⚠️ Chưa có VNINDEX cuối ngày hợp lệ cho {expected_scan_date}; "
+                    f"đã thử dữ liệu phiên {scan_date}.\n{message}")
+        return message
+    if vn100_mode:
+        gainers = [signal for signal in signals if signal.change_pct is not None and signal.change_pct > 0]
+        losers = [signal for signal in signals if signal.change_pct is not None and signal.change_pct < 0]
+        ranked = sorted(gainers + losers, key=lambda item: (-item.score, item.ticker))
+        lines = [f"🔎 VN100 — {len(ranked)} mã tính được điểm và có biến động",
+                 f"🟢 Đang tăng: {len(gainers)} | 🔴 Đang giảm: {len(losers)}"]
+        if scan_date:
+            lines.insert(1, f"Phiên dữ liệu: {scan_date}")
+        if scan_date and expected_scan_date and scan_date != expected_scan_date:
+            lines.insert(1, f"⚠️ Đang dùng phiên {scan_date}, không phải phiên dự kiến {expected_scan_date}.")
+        if refresh_error:
+            lines.append(f"Dữ liệu chưa được làm mới: {refresh_error[:120]}")
+
+        def row(signal: Signal) -> str:
+            icon = "🟢" if signal.change_pct and signal.change_pct > 0 else "🔴"
+            return f"{icon} {signal.ticker}: {signal.change_pct:+.2f}% · {signal.score:.2f}/100"
+
+        lines.append("\n🏆 Điểm cao nhất (top 10):")
+        lines.extend(row(signal) for signal in ranked[:10])
+        lines.append("\n📉 Điểm thấp nhất (bottom 10):")
+        lines.extend(row(signal) for signal in sorted(ranked, key=lambda item: (item.score, item.ticker))[:10])
+        lines.extend(["", "Chỉ gồm mã VN100 tăng/giảm và tính được điểm.", DISCLAIMER])
+        return "\n".join(lines)
     ready = [signal for signal in signals if signal.status is SignalStatus.WATCH_ONLY]
     buys = [signal for signal in signals if signal.status is SignalStatus.SUCCESS and signal.action is Action.BUY]
     sells = [signal for signal in signals if signal.status is SignalStatus.SUCCESS and signal.action is Action.SELL]
@@ -250,16 +360,54 @@ def format_scan(signals: list[Signal], timezone_name: str,
     lines = [f"🔎 Đã quét {len(signals)} mã toàn thị trường",
              f"BUY: {len(buys)} | SELL: {len(sells)} | Theo dõi: {len(ready)} | Dữ liệu cũ: {stale} | Chưa đủ: {missing} | Lỗi: {errors}"]
     if scan_date:
-        lines.insert(1, f"Phiên dữ liệu: {scan_date} (đã lưu; /scan không crawl)")
+        lines.insert(1, f"Phiên dữ liệu: {scan_date}")
+    if scan_date and expected_scan_date and scan_date != expected_scan_date:
+        lines.insert(1, f"⚠️ Chưa có VNINDEX cuối ngày hợp lệ cho {expected_scan_date}; "
+                        f"đang dùng dữ liệu phiên {scan_date}. Đây không phải tín hiệu của {expected_scan_date}.")
     if breadth and breadth[1]:
         lines.append(f"Breadth HOSE: {breadth[0]}/{breadth[1]} mã tăng ({100*breadth[0]/breadth[1]:.1f}%)")
     if refresh_error:
         lines.append(f"Dữ liệu chưa được làm mới: {refresh_error[:120]}")
+    unavailable = [signal.ticker for signal in signals
+                   if signal.status in {SignalStatus.STALE_DATA,
+                                        SignalStatus.INSUFFICIENT_DATA,
+                                        SignalStatus.PROVIDER_ERROR}]
+    if unavailable:
+        shown = unavailable[:30]
+        suffix = f" và {len(unavailable) - len(shown)} mã khác" if len(unavailable) > len(shown) else ""
+        lines.append("Không lấy được dữ liệu đúng phiên cho: "
+                     f"{', '.join(shown)}{suffix}.")
     for label, icon, group in (("BUY", "🟢", buys), ("SELL", "🔴", sells)):
         lines.append(f"\n{icon} {label} (top 10):")
         lines.extend(f"{icon} {signal.ticker}: {_score_label(signal)}"
                      for signal in sorted(group, key=lambda item: (-item.score, item.ticker))[:10])
-    lines.extend(["", "Tín hiệu tính tại Close; lệnh mô phỏng ở Open phiên sau.", DISCLAIMER])
+    lines.extend(["", "Tín hiệu tính tại Close; lệnh ảo mới dùng giá API tại lúc đặt.", DISCLAIMER])
+    return "\n".join(lines)
+
+
+def format_daily_digest(session: str, items: list[tuple[str, Signal | None]],
+                        coverage: tuple[int, int] | None = None) -> str:
+    lines = [f"📅 Tổng kết danh mục — phiên {session}",
+             "Dữ liệu cuối ngày đã lưu; không phải giá trực tiếp."]
+    if coverage and coverage[1]:
+        lines.append(f"Độ bao phủ thị trường: {coverage[0]}/{coverage[1]} mã có giá hợp lệ.")
+        if coverage[0] < coverage[1]:
+            lines.append("⚠️ Một số mã chưa có giá phiên này; không suy diễn thành tín hiệu BÁN.")
+    for ticker, signal in items:
+        if signal is None or signal.data_time.date().isoformat() != session:
+            lines.append(f"⚪ {ticker}: chưa có tín hiệu đúng phiên.")
+            continue
+        if signal.status is SignalStatus.SUCCESS and signal.action is Action.BUY:
+            icon, label = "🟢", "MUA"
+        elif signal.status is SignalStatus.SUCCESS and signal.action is Action.SELL:
+            icon, label = "🔴", "BÁN"
+        elif signal.status is SignalStatus.WATCH_ONLY or signal.action is Action.HOLD:
+            icon, label = "🟡", "THEO DÕI"
+        else:
+            icon, label = "⚪", "THIẾU DỮ LIỆU"
+        price = f" · Close {_metric(signal.price, 0)} VNĐ" if signal.price > 0 else ""
+        lines.append(f"{icon} {ticker}: {label}{price} · {_score_label(signal)}")
+    lines.extend(["", "/soi <MÃ> để xem lý do · /digest off để dừng", DISCLAIMER])
     return "\n".join(lines)
 
 
@@ -319,8 +467,10 @@ def format_delete_result(removed: list[str], missing: list[str], invalid: list[s
     return "\n".join(lines) or "Không có mã nào để xóa."
 
 
-def format_status(provider: str, database_ok: bool, server_time: datetime, data_time: str) -> str:
-    return (
+def format_status(provider: str, database_ok: bool, server_time: datetime, data_time: str,
+                  last_full_eod: str | None = None, expected_eod: str | None = None,
+                  refresh_health: dict | None = None) -> str:
+    message = (
         "Trạng thái hệ thống\n\n"
         "Bot: Đang hoạt động\n"
         f"Signal Provider: {provider}\n"
@@ -328,3 +478,26 @@ def format_status(provider: str, database_ok: bool, server_time: datetime, data_
         f"Thời gian server: {server_time.strftime('%H:%M:%S %d/%m/%Y %Z')}\n"
         f"Dữ liệu provider: {data_time}"
     )
+    if expected_eod:
+        message += (f"\nPhiên EOD cần có: {expected_eod}"
+                    f"\nCập nhật toàn thị trường đã xác nhận: {last_full_eod or 'chưa có'}")
+        if last_full_eod != expected_eod:
+            message += "\n⚠️ Dữ liệu toàn thị trường chưa hoàn tất."
+    if refresh_health:
+        state = refresh_health.get("state", "waiting")
+        message += f"\nTác vụ EOD: {state}"
+        if refresh_health.get("target"):
+            message += f"\nPhiên đang theo dõi: {refresh_health['target']}"
+        if refresh_health.get("covered") is not None:
+            message += (f"\nMã đã lưu hợp lệ: {refresh_health['covered']}/"
+                        f"{refresh_health.get('universe', '?')}"
+                        f"; cần ít nhất {refresh_health.get('required', '?')}")
+        if refresh_health.get("failed_symbols"):
+            message += f"\nMã tải lỗi: {refresh_health['failed_symbols']}"
+        if refresh_health.get("missing_symbols"):
+            message += f"\nMã còn thiếu: {refresh_health['missing_symbols']}"
+        if refresh_health.get("last_success"):
+            message += f"\nCập nhật thành công gần nhất: {refresh_health['last_success']}"
+        if state == "failed":
+            message += f"; thử lại sau khoảng {refresh_health.get('retry_minutes', '?')} phút"
+    return message

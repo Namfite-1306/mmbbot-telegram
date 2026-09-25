@@ -38,6 +38,7 @@ class Signal:
     timeframe: str
     status: SignalStatus
     score_components: dict[str, float | None] | None = None
+    change_pct: float | None = None
 
     def __post_init__(self) -> None:
         ticker = self.ticker.strip().upper()
@@ -49,6 +50,8 @@ class Signal:
             raise SignalValidationError("ticker không được để trống")
         if not math.isfinite(self.score) or not 0 <= self.score <= 100:
             raise SignalValidationError("score phải nằm trong khoảng 0–100")
+        if self.change_pct is not None and not math.isfinite(self.change_pct):
+            raise SignalValidationError("change_pct phải là số hữu hạn")
         if self.data_time.tzinfo is None or self.data_time.utcoffset() is None:
             raise SignalValidationError("data_time phải có timezone")
         if self.generated_at.tzinfo is None or self.generated_at.utcoffset() is None:

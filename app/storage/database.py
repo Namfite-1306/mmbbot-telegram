@@ -68,11 +68,62 @@ CREATE TABLE IF NOT EXISTS paper_orders (
     tax INTEGER NOT NULL DEFAULT 0,
     cash_amount INTEGER,
     realized_pnl INTEGER,
+    quote_source TEXT,
+    quote_time TEXT,
     note TEXT,
     FOREIGN KEY(chat_id) REFERENCES paper_accounts(chat_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_paper_orders_pending ON paper_orders(status, requested_date);
 CREATE INDEX IF NOT EXISTS idx_paper_orders_chat ON paper_orders(chat_id, id DESC);
+CREATE TABLE IF NOT EXISTS paper_journal (
+    order_id INTEGER PRIMARY KEY,
+    chat_id INTEGER NOT NULL,
+    thesis TEXT,
+    exit_rule TEXT,
+    reflection TEXT,
+    signal_status TEXT,
+    signal_action TEXT,
+    signal_score REAL,
+    signal_date TEXT,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(order_id) REFERENCES paper_orders(id) ON DELETE CASCADE,
+    FOREIGN KEY(chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_paper_journal_chat ON paper_journal(chat_id, order_id DESC);
+CREATE TABLE IF NOT EXISTS paper_adjustments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('CAPITAL', 'POSITION')),
+    ticker TEXT,
+    old_amount INTEGER NOT NULL,
+    new_amount INTEGER NOT NULL,
+    old_basis INTEGER,
+    new_basis INTEGER,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(chat_id) REFERENCES paper_accounts(chat_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS paper_order_events (
+    order_id INTEGER PRIMARY KEY,
+    chat_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    sent_at TEXT,
+    FOREIGN KEY(order_id) REFERENCES paper_orders(id) ON DELETE CASCADE,
+    FOREIGN KEY(chat_id) REFERENCES paper_accounts(chat_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_paper_order_events_pending ON paper_order_events(sent_at, order_id);
+CREATE TABLE IF NOT EXISTS digest_subscriptions (
+    chat_id INTEGER PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS daily_digests (
+    chat_id INTEGER NOT NULL,
+    session TEXT NOT NULL,
+    sent_at TEXT NOT NULL,
+    PRIMARY KEY(chat_id, session),
+    FOREIGN KEY(chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
+);
 """
 
 
@@ -91,6 +142,14 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(paper_journal)")}
+            if "signal_status" not in columns:
+                connection.execute("ALTER TABLE paper_journal ADD COLUMN signal_status TEXT")
+            order_columns = {row[1] for row in connection.execute("PRAGMA table_info(paper_orders)")}
+            if "quote_source" not in order_columns:
+                connection.execute("ALTER TABLE paper_orders ADD COLUMN quote_source TEXT")
+            if "quote_time" not in order_columns:
+                connection.execute("ALTER TABLE paper_orders ADD COLUMN quote_time TEXT")
 
     def healthcheck(self) -> bool:
         try:

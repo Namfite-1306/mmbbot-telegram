@@ -116,6 +116,35 @@ class SettingsRepository:
             ).fetchall()
         return [row["chat_id"] for row in rows]
 
+    def set_digest(self, chat_id: int, enabled: bool) -> None:
+        with self.database.connect() as connection:
+            connection.execute("""INSERT INTO digest_subscriptions(chat_id,enabled,updated_at)
+                VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET
+                enabled=excluded.enabled,updated_at=excluded.updated_at""",
+                (chat_id, int(enabled), utc_now()))
+
+    def digest_enabled(self, chat_id: int) -> bool:
+        with self.database.connect() as connection:
+            row = connection.execute("SELECT enabled FROM digest_subscriptions WHERE chat_id=?",
+                                     (chat_id,)).fetchone()
+        return bool(row and row["enabled"])
+
+    def digest_subscribers(self) -> list[int]:
+        with self.database.connect() as connection:
+            rows = connection.execute("SELECT chat_id FROM digest_subscriptions WHERE enabled=1").fetchall()
+        return [row["chat_id"] for row in rows]
+
+    def digest_was_sent(self, chat_id: int, session: str) -> bool:
+        with self.database.connect() as connection:
+            return connection.execute("SELECT 1 FROM daily_digests WHERE chat_id=? AND session=?",
+                                      (chat_id, session)).fetchone() is not None
+
+    def record_digest_sent(self, chat_id: int, session: str) -> bool:
+        with self.database.connect() as connection:
+            cursor = connection.execute("""INSERT OR IGNORE INTO daily_digests(chat_id,session,sent_at)
+                VALUES(?,?,?)""", (chat_id, session, utc_now()))
+        return cursor.rowcount == 1
+
 
 class NotificationRepository:
     def __init__(self, database: Database):

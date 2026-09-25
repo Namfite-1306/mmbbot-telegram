@@ -12,10 +12,12 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from app.models import Action, Signal, SignalStatus
-from app.market_store import BOT_DIR, CLEAN_DIR, MarketStore, previous_weekday
+from app.market_store import BOT_DIR, CLEAN_DIR, MarketStore
 from app.providers.base import ProviderError, SignalProvider, TickerNotFoundError
+from app.trading_calendar import previous_trading_day
 from app.strategy_engine import (SampleStrategyEngine, StrategyDataError, VietcapStrategyEngine,
                                  calculate_total_score, market_regime)
+from app.vn100 import VN100_SYMBOLS
 
 
 logger = logging.getLogger(__name__)
@@ -40,7 +42,7 @@ class StrategySignalProvider(SignalProvider):
         self.auto_refresh = auto_refresh and isinstance(engine, VietcapStrategyEngine)
         self._refresh_lock = Lock()
         self._scan_lock = asyncio.Lock()
-        self._scan_cache: tuple[str, float, list[Signal]] | None = None
+        self._scan_cache: tuple[str, str, float, list[Signal]] | None = None
         self._scan_revision = 0
         self.last_refresh_error: str | None = None
         self.last_breadth: tuple[int, int] | None = None
@@ -53,6 +55,7 @@ class StrategySignalProvider(SignalProvider):
         self, ticker: str, data_date: pd.Timestamp, status: SignalStatus,
         action: Action | None, price: float, score: float, reasons: list[str],
         score_components: dict[str, float | None] | None = None,
+        change_pct: float | None = None,
     ) -> Signal:
         data_time = datetime.combine(data_date.date(), time(15, 0), tzinfo=self.timezone)
         return Signal(
@@ -68,6 +71,7 @@ class StrategySignalProvider(SignalProvider):
             timeframe="1D",
             status=status,
             score_components=score_components,
+            change_pct=change_pct,
         )
 
     def _build_signal(self, ticker: str, refresh_error: str | None = None,
@@ -89,7 +93,7 @@ class StrategySignalProvider(SignalProvider):
             last = prices.iloc[-1]
             technical = self.engine.technical(prices)
             reasons = [
-                f"T={technical['trend']:.0f}/100; E={technical['entry']['status']}",
+                f"Cổng vào lệnh: {technical['entry']['status']}",
                 *technical["entry"]["reasons"],
             ]
             status = SignalStatus.WATCH_ONLY
@@ -120,7 +124,7 @@ class StrategySignalProvider(SignalProvider):
                     fundamental_score = self.engine.fundamental(normalized, last["date"], exchange)
                     fundamental_valid = True
                 except StrategyDataError as exc:
-                    reasons.append(f"F chưa tính được: {exc}")
+                    reasons.append(f"Chưa tính được điểm: {exc}")
                 try:
                     if benchmark is None:
                         benchmark = (self.engine.index(last["date"], exchange)
@@ -129,12 +133,11 @@ class StrategySignalProvider(SignalProvider):
                     momentum_score = self.engine.momentum(prices, benchmark)
                     momentum_valid = True
                 except StrategyDataError as exc:
-                    reasons.append(f"M chưa tính được: {exc}")
+                    reasons.append(f"Chưa tính được điểm: {exc}")
                 if fundamental_valid and momentum_valid:
                     score = calculate_total_score(technical["trend"], fundamental_score, momentum_score)
-                    reasons.insert(0, f"T={technical['trend']:.0f}, F={fundamental_score:.2f}, M={momentum_score:.0f}")
                 else:
-                    reasons.insert(0, "Chưa có điểm tổng T/F/M; hiển thị điểm T kỹ thuật")
+                    reasons.insert(0, "Chưa đủ dữ liệu đầu vào để tính điểm.")
             if isinstance(self.engine, VietcapStrategyEngine):
                 if not bool(last["has_adjusted_history"]):
                     reasons.append("Chưa có adjusted OHLC; tín hiệu trên giá thô, không đồng nhất với PnL thực")
@@ -151,7 +154,7 @@ class StrategySignalProvider(SignalProvider):
                 elif 60 <= score < 75:
                     reasons.append("WATCH V1: điểm trong khoảng 60–75")
                 elif score >= 75:
-                    reasons.append("Điểm đạt 75 nhưng cổng E/regime hoặc dữ liệu M chưa hợp lệ")
+                    reasons.append("Điểm đạt ngưỡng nhưng điều kiện vào lệnh hoặc dữ liệu chưa hợp lệ")
                 if regime == "UNKNOWN":
                     reasons.append("Thiếu breadth/benchmark cùng phiên: không phát BUY mới")
                 if fundamental_valid:
@@ -173,12 +176,17 @@ class StrategySignalProvider(SignalProvider):
                 reasons.insert(0, "Mã chưa có giá đúng phiên quét; không phát BUY/SELL")
             if is_sample:
                 reasons.append("Giá từ workbook Yahoo mẫu; không phải dữ liệu thị trường trực tiếp")
+            previous_close = (float(prices.iloc[-2]["display_close"])
+                              if len(prices) >= 2 else None)
+            change_pct = (100 * (float(last["display_close"]) / previous_close - 1)
+                          if previous_close is not None and previous_close > 0 else None)
             return self._make_signal(
                 normalized, last["date"], status,
                 action,
                 float(last["display_close"]),
                 score, reasons,
                 {"T": technical["trend"], "F": fundamental_score, "M": momentum_score},
+                change_pct,
             )
         except StrategyDataError as exc:
             return self._make_signal(
@@ -213,30 +221,42 @@ class StrategySignalProvider(SignalProvider):
                 self._scan_cache = None
         return self._build_signal(ticker, error)
 
-    async def get_market_signals(self) -> list[Signal]:
+    async def get_market_signals(self, *, allow_previous_session: bool = False,
+                                 symbols: frozenset[str] | None = None) -> list[Signal]:
         async with self._scan_lock:
+            scope = "VN100" if symbols == VN100_SYMBOLS else "CUSTOM" if symbols else "ALL"
             scan_day = None
             if isinstance(self.engine, VietcapStrategyEngine):
+                today = self._current_time().date()
+                expected = previous_trading_day(today)
                 scan_day = await asyncio.to_thread(
-                    self.engine.store.last_scan_session, self._current_time().date())
+                    self.engine.store.last_scan_session, today)
+                if not scan_day and allow_previous_session:
+                    scan_day = await asyncio.to_thread(
+                        self.engine.store.last_scan_session, expected)
                 if not scan_day:
-                    expected = previous_weekday(self._current_time().date())
+                    self.last_scan_date = None
+                    if allow_previous_session:
+                        raise ProviderError(f"Chưa có VNINDEX cuối ngày hợp lệ cho {expected} "
+                                            "hoặc phiên giao dịch liền trước")
                     raise ProviderError(f"Chưa có VNINDEX cuối ngày hợp lệ cho {expected}; "
                                         "không dùng phiên cũ để quét")
                 self.last_scan_date = scan_day
                 cached = self._scan_cache
-                if cached and cached[0] == scan_day and monotonic() - cached[1] < 300:
-                    return list(cached[2])
+                if (cached and cached[0] == scan_day and cached[1] == scope
+                        and monotonic() - cached[2] < 300):
+                    return list(cached[3])
             revision = self._scan_revision
-            signals = await self._evaluate_market(scan_day)
+            signals = await self._evaluate_market(scan_day, symbols)
             if scan_day and revision == self._scan_revision:
-                self._scan_cache = (scan_day, monotonic(), signals)
+                self._scan_cache = (scan_day, scope, monotonic(), signals)
             return signals
 
-    async def _evaluate_market(self, scan_day: str | None) -> list[Signal]:
+    async def _evaluate_market(self, scan_day: str | None,
+                               symbols: frozenset[str] | None = None) -> list[Signal]:
         try:
             universe = await asyncio.to_thread(self.engine.universe)
-            tickers = sorted(universe)
+            tickers = sorted(set(universe).intersection(symbols) if symbols else universe)
             self.last_refresh_error = None
             if isinstance(self.engine, VietcapStrategyEngine):
                 assert scan_day is not None

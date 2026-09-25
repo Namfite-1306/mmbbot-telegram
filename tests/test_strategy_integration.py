@@ -167,7 +167,7 @@ def test_sample_provider_watch_only_without_live_orders() -> None:
         assert fpt.status is SignalStatus.WATCH_ONLY
         assert fpt.action is None
         assert 0 <= fpt.score <= 100
-        assert "E=" in " ".join(fpt.reasons)
+        assert "Cổng vào lệnh:" in " ".join(fpt.reasons)
 
         current = StrategySignalProvider(engine=SampleStrategyEngine(), now=datetime(2026, 9, 21, 16, tzinfo=VN_TZ), auto_refresh=False)
         stale = await current.get_signal("FPT")

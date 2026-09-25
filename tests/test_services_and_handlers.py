@@ -4,22 +4,97 @@ import asyncio
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
 from telegram.error import BadRequest, NetworkError
+from telegram.ext import CommandHandler, MessageHandler
 
 from app.bot.formatter import format_help, format_start
 from app.bot.handlers import BotHandlers
 from app.config import Settings
-from app.main import RedactingFormatter
+from app.main import RedactingFormatter, main
 from app.providers import MockSignalProvider
+from app.providers.base import ProviderError
 from app.providers.strategy_signal_provider import StrategySignalProvider
 from app.strategy_engine import VietcapStrategyEngine
-from app.models import Signal, SignalStatus
+from app.models import Action, Signal, SignalStatus
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from app.services import SignalService, SubscriptionService
 from app.storage import Database, SettingsRepository, UserRepository, WatchlistRepository
+
+
+def test_start_replies_when_update_reaches_handler(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database = Database(tmp_path / "start.db")
+        database.initialize()
+        subscriptions = SubscriptionService(
+            UserRepository(database), WatchlistRepository(database), SettingsRepository(database)
+        )
+        handlers = BotHandlers(Settings("fake-token", database_path=tmp_path / "start.db"),
+                               SignalService(MockSignalProvider()), subscriptions, database)
+        reply = AsyncMock()
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=1),
+            effective_user=SimpleNamespace(username="tester"),
+            effective_message=SimpleNamespace(reply_text=reply),
+        )
+        await handlers.start(update, SimpleNamespace())
+        assert "Mr. Mission Bossible" in reply.await_args.args[0]
+
+    asyncio.run(scenario())
+
+
+def test_command_shows_waiting_message_then_edits_response(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database = Database(tmp_path / "waiting.db")
+        database.initialize()
+        subscriptions = SubscriptionService(
+            UserRepository(database), WatchlistRepository(database), SettingsRepository(database)
+        )
+        handlers = BotHandlers(Settings("fake-token", database_path=tmp_path / "waiting.db"),
+                               SignalService(MockSignalProvider()), subscriptions, database)
+        waiting = SimpleNamespace(edit_text=AsyncMock(), delete=AsyncMock())
+        reply = AsyncMock(return_value=waiting)
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=1),
+            effective_user=SimpleNamespace(username="tester"),
+            effective_message=SimpleNamespace(reply_text=reply),
+        )
+        await handlers._with_waiting(handlers.start)(update, SimpleNamespace())
+        reply.assert_awaited_once_with("Vui lòng chờ phản hồi")
+        assert "Mr. Mission Bossible" in waiting.edit_text.await_args.args[0]
+        waiting.delete.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
+def test_waiting_messages_do_not_cross_concurrent_chats(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database = Database(tmp_path / "concurrent.db")
+        database.initialize()
+        subscriptions = SubscriptionService(
+            UserRepository(database), WatchlistRepository(database), SettingsRepository(database)
+        )
+        handlers = BotHandlers(Settings("fake-token", database_path=tmp_path / "concurrent.db"),
+                               SignalService(MockSignalProvider()), subscriptions, database)
+        waiting = [SimpleNamespace(edit_text=AsyncMock(), delete=AsyncMock()) for _ in range(2)]
+        updates = [SimpleNamespace(effective_chat=SimpleNamespace(id=index + 1),
+                                   effective_message=SimpleNamespace(
+                                       reply_text=AsyncMock(return_value=waiting[index])))
+                   for index in range(2)]
+
+        async def respond(update, context):
+            await asyncio.sleep(0)
+            await handlers._reply(update, f"chat {update.effective_chat.id}")
+
+        await asyncio.gather(*(handlers._with_waiting(respond)(update, SimpleNamespace())
+                               for update in updates))
+        assert waiting[0].edit_text.await_args.args[0] == "chat 1"
+        assert waiting[1].edit_text.await_args.args[0] == "chat 2"
+
+    asyncio.run(scenario())
 
 
 def test_missing_soi_argument(tmp_path: Path) -> None:
@@ -44,7 +119,8 @@ def test_missing_soi_argument(tmp_path: Path) -> None:
         context = SimpleNamespace(args=[])
         await handlers.soi(update, context)
         reply.assert_awaited_once()
-        assert "Cú pháp: /soi" in reply.await_args.args[0]
+        assert "Cú pháp đúng: /soi <MÃ>" in reply.await_args.args[0]
+        assert "Ví dụ: /soi FPT" in reply.await_args.args[0]
 
     asyncio.run(scenario())
 
@@ -83,6 +159,15 @@ def test_command_guidance_uses_ticker_placeholder() -> None:
         assert "/remove" in format_help()
         assert "FPT" not in message
         assert "HPG" not in message
+
+
+def test_start_uses_icons_for_commands() -> None:
+    message = format_start()
+    assert message.startswith("👋 ")
+    assert "🔎 /analyze <MÃ>" in message
+    assert "📡 /scan" in message
+    assert "💼 /portfolio" in message
+    assert "📈 /chart <MÃ>" in message
 
 
 def test_ticker_not_found_is_not_system_error() -> None:
@@ -137,7 +222,8 @@ def test_strategy_soi_includes_chart_button_and_score_breakdown(tmp_path: Path) 
                         timestamp, "v1", "1D", SignalStatus.WATCH_ONLY,
                         {"T": 100, "F": None, "M": 50})
         provider = StrategySignalProvider(engine=VietcapStrategyEngine(Store()), auto_refresh=False)
-        provider.get_signal = AsyncMock(return_value=signal)
+        provider.get_saved_signal = AsyncMock(return_value=signal)
+        provider.get_signal = AsyncMock(side_effect=AssertionError("/soi must not crawl EOD data"))
         database = Database(tmp_path / "bot.db")
         database.initialize()
         subscriptions = SubscriptionService(UserRepository(database), WatchlistRepository(database),
@@ -156,16 +242,124 @@ def test_strategy_soi_includes_chart_button_and_score_breakdown(tmp_path: Path) 
             await handlers.soi(update, SimpleNamespace(args=["AAA"]))
         message = reply.await_args.args[0]
         markup = reply.await_args.kwargs["reply_markup"]
-        assert "Chưa có điểm tổng" in message
+        assert "Điểm: chưa tính được." in message
+        assert "T: 100/100" not in message and "F: chưa có" not in message and "M: 50/100" not in message
         assert "10.100 VNĐ" in message
         assert markup.inline_keyboard[0][0].callback_data == "chart:AAA"
         assert markup.inline_keyboard[0][1].callback_data == "flow:AAA"
+        assert markup.inline_keyboard[1][0].callback_data == "trade:buy:AAA"
+        assert markup.inline_keyboard[1][1].callback_data == "trade:sell:AAA"
+        assert markup.inline_keyboard[2][0].callback_data == "paper:account"
 
         reply.reset_mock()
         with patch("app.bot.handlers.fetch_company_news", return_value=[]), \
              patch("app.bot.handlers.DNSEMarketClient", side_effect=RuntimeError("offline")):
             await handlers.soi(update, SimpleNamespace(args=["AAA"]))
         assert "dùng dữ liệu đã lưu" in reply.await_args.args[0]
+
+    asyncio.run(scenario())
+
+
+def test_add_remove_buttons_and_trade_callback_include_selected_ticker(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database = Database(tmp_path / "actions.db")
+        database.initialize()
+        subscriptions = SubscriptionService(
+            UserRepository(database), WatchlistRepository(database), SettingsRepository(database))
+        service = SignalService(MockSignalProvider())
+        service.ticker_exists = AsyncMock(return_value=True)
+        handlers = BotHandlers(Settings("fake-token", database_path=database.path),
+                               service, subscriptions, database)
+        reply = AsyncMock()
+        message = SimpleNamespace(text="/add AAA", reply_text=reply)
+        update = SimpleNamespace(effective_chat=SimpleNamespace(id=7, type="private"),
+                                 effective_user=SimpleNamespace(username="tester"),
+                                 effective_message=message)
+
+        await handlers.add(update, SimpleNamespace(args=["AAA"]))
+        buttons = reply.await_args.kwargs["reply_markup"].inline_keyboard[0]
+        assert [button.callback_data for button in buttons] == [
+            "nav:portfolio", "nav:modelportfolio"]
+
+        reply.reset_mock()
+        await handlers.delete(update, SimpleNamespace(args=["AAA"]))
+        buttons = reply.await_args.kwargs["reply_markup"].inline_keyboard[0]
+        assert [button.callback_data for button in buttons] == [
+            "nav:portfolio", "nav:modelportfolio"]
+
+        reply.reset_mock()
+        query = SimpleNamespace(data="trade:buy:AAA", answer=AsyncMock())
+        callback_update = SimpleNamespace(
+            callback_query=query,
+            effective_chat=SimpleNamespace(id=7, type="private"),
+            effective_message=SimpleNamespace(reply_text=reply),
+        )
+        await handlers.stock_action_callback(callback_update, SimpleNamespace())
+        assert "/paperbuy AAA <SỐ_CP>" in reply.await_args.args[0]
+
+    asyncio.run(scenario())
+
+
+def test_removed_paper_note_commands_are_not_exposed() -> None:
+    help_text = format_help().lower()
+    assert "paperjournal" not in help_text
+    assert "paperreview" not in help_text
+    assert not hasattr(BotHandlers, "paper_journal")
+    assert not hasattr(BotHandlers, "paper_review")
+
+
+def test_manual_command_aliases_are_registered_and_unknown_commands_reply(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database = Database(tmp_path / "manual_commands.db")
+        database.initialize()
+        subscriptions = SubscriptionService(
+            UserRepository(database), WatchlistRepository(database), SettingsRepository(database))
+        handlers = BotHandlers(Settings("fake-token", database_path=database.path),
+                               SignalService(MockSignalProvider()), subscriptions, database)
+        registered = []
+        application = SimpleNamespace(add_handler=registered.append,
+                                      add_error_handler=lambda callback: None)
+        handlers.register(application)
+        commands = set().union(*(item.commands for item in registered
+                                 if isinstance(item, CommandHandler)))
+        assert {"buy", "mua", "sell", "ban", "phanbo"} <= commands
+        assert any(isinstance(item, MessageHandler) for item in registered)
+
+        reply = AsyncMock()
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=9, type="private"),
+            effective_user=SimpleNamespace(username="tester"),
+            effective_message=SimpleNamespace(text="/khongco AAA", reply_text=reply),
+        )
+        await handlers.unknown_command(update, SimpleNamespace())
+        assert "Không nhận ra lệnh /khongco" in reply.await_args.args[0]
+
+        reply.reset_mock()
+        update.effective_message.text = "/char"
+        await handlers.unknown_command(update, SimpleNamespace())
+        assert "Có phải bạn muốn dùng /chart?" in reply.await_args.args[0]
+        assert "Ví dụ: /chart FPT" in reply.await_args.args[0]
+
+    asyncio.run(scenario())
+
+
+def test_invalid_command_keeps_usage_guidance_when_reply_has_network_error(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database = Database(tmp_path / "command_error.db")
+        database.initialize()
+        subscriptions = SubscriptionService(
+            UserRepository(database), WatchlistRepository(database), SettingsRepository(database))
+        handlers = BotHandlers(Settings("fake-token", database_path=database.path),
+                               SignalService(MockSignalProvider()), subscriptions, database)
+        reply = AsyncMock()
+        message = SimpleNamespace(text="/chart", reply_text=reply)
+        update = SimpleNamespace(effective_chat=SimpleNamespace(id=10, type="private"),
+                                 effective_message=message)
+        await handlers.error(update, SimpleNamespace(error=NetworkError("temporary")))
+        response = reply.await_args.args[0]
+        assert "Cú pháp đúng: /chart <MÃ>" in response
+        assert "Ví dụ: /chart FPT" in response
+        assert "Kết nối Telegram" not in response
 
     asyncio.run(scenario())
 
@@ -287,3 +481,117 @@ def test_scan_order_buy_then_sell_score_descending() -> None:
         assert sell_scores == sorted(sell_scores, reverse=True)
 
     asyncio.run(scenario())
+
+
+def test_vn100_scan_excludes_incomplete_unchanged_and_non_members() -> None:
+    async def scenario() -> None:
+        from app.vn100 import VN100_SYMBOLS
+
+        stamp = datetime(2026, 9, 24, 15, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
+
+        def make(ticker: str, components: dict[str, float | None], change: float) -> Signal:
+            return Signal(ticker, ticker, None, 10_000, 70, [], stamp, stamp,
+                          "v1", "1D", SignalStatus.WATCH_ONLY, components, change)
+
+        provider = StrategySignalProvider(engine=SimpleNamespace(), auto_refresh=False)
+        provider.get_market_signals = AsyncMock(return_value=[
+            make("ACB", {"T": 70, "F": 70, "M": 70}, 1.0),
+            make("FPT", {"T": 70, "F": None, "M": 70}, -1.0),
+            make("HPG", {"T": 70, "F": 70, "M": 70}, 0.0),
+            make("AAA", {"T": 70, "F": 70, "M": 70}, 1.0),
+        ])
+
+        result = await SignalService(provider).scan(vn100_only=True)
+
+        assert [signal.ticker for signal in result] == ["ACB"]
+        assert provider.get_market_signals.await_args.kwargs["symbols"] == VN100_SYMBOLS
+
+    asyncio.run(scenario())
+
+
+def test_scan_reports_missing_eod_data_instead_of_empty_results(tmp_path: Path) -> None:
+    class MissingEodProvider:
+        name = "strategy"
+
+        async def get_market_signals(self):
+            raise ProviderError("Chưa có VNINDEX cuối ngày hợp lệ cho 2026-09-23")
+
+    async def scenario() -> None:
+        service = SignalService(MissingEodProvider())
+        with pytest.raises(ProviderError, match="2026-09-23"):
+            await service.scan()
+
+        database = Database(tmp_path / "scan.db")
+        database.initialize()
+        subscriptions = SubscriptionService(
+            UserRepository(database), WatchlistRepository(database), SettingsRepository(database)
+        )
+        handlers = BotHandlers(Settings("fake-token", database_path=tmp_path / "scan.db"),
+                               service, subscriptions, database)
+        reply = AsyncMock()
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=1),
+            effective_user=SimpleNamespace(username="tester"),
+            effective_message=SimpleNamespace(reply_text=reply),
+        )
+        await handlers.scan(update, SimpleNamespace())
+        assert "2026-09-23" in reply.await_args.args[0]
+
+    asyncio.run(scenario())
+
+
+def test_scan_sends_separate_paper_trade_prompt_and_portfolio_button(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        from app.market_store import MarketStore
+
+        database = Database(tmp_path / "scan_prompt.db")
+        database.initialize()
+        store = MarketStore(database.path)
+        store.initialize()
+        with store.connect() as conn:
+            conn.execute("INSERT INTO market_symbols VALUES('AAA','HSX','STOCK')")
+            conn.execute("""INSERT INTO market_indices(symbol,trade_date,close,is_final)
+                VALUES('VNINDEX','2026-09-24',1800,1)""")
+        subscriptions = SubscriptionService(
+            UserRepository(database), WatchlistRepository(database), SettingsRepository(database))
+        provider = StrategySignalProvider(engine=VietcapStrategyEngine(store),
+                                          now=datetime(2026, 9, 25, 10,
+                                                       tzinfo=ZoneInfo("Asia/Ho_Chi_Minh")))
+        stamp = datetime(2026, 9, 24, 15, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
+        provider.get_market_signals = AsyncMock(return_value=[
+            Signal("vn100-acb", "ACB", Action.BUY, 25_000, 82, [], stamp, stamp,
+                   "v1", "1D", SignalStatus.SUCCESS,
+                   {"T": 80, "F": 82, "M": 85}, 1.25)
+        ])
+        handler = BotHandlers(Settings("fake-token", database_path=database.path),
+                              SignalService(provider), subscriptions, database)
+        reply = AsyncMock()
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=1, type="private"),
+            effective_user=SimpleNamespace(username="tester"),
+            effective_message=SimpleNamespace(reply_text=reply),
+        )
+        await handler.scan(update, SimpleNamespace())
+        assert reply.await_count == 2
+        assert "VN100" in reply.await_args_list[0].args[0]
+        assert "ACB: +1.25% · 82.00/100" in reply.await_args_list[0].args[0]
+        assert "Bạn muốn mua/bán ảo" in reply.await_args_list[1].args[0]
+        buttons = reply.await_args_list[1].kwargs["reply_markup"].inline_keyboard
+        assert buttons[1][0].callback_data == "paper:account"
+
+    asyncio.run(scenario())
+
+
+def test_polling_retries_transient_telegram_bootstrap_errors(monkeypatch, tmp_path: Path) -> None:
+    settings = Settings("123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrst",
+                        database_path=tmp_path / "bot.db")
+    args = SimpleNamespace(env_file=".env", init_db=False, import_market_data=False,
+                           check_config=False, check_token=False, run_alert_once=False)
+    application = SimpleNamespace(run_polling=Mock())
+    monkeypatch.setattr("app.main.parse_args", lambda: args)
+    monkeypatch.setattr("app.main.Settings.from_env", lambda *a, **k: settings)
+    monkeypatch.setattr("app.main.configure_logging", lambda level: None)
+    monkeypatch.setattr("app.main.build_application", lambda value: application)
+
+    assert main() == 0
+    assert application.run_polling.call_args.kwargs["bootstrap_retries"] == 5

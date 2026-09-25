@@ -1,0 +1,53 @@
+{
+  "config": {
+    "initial_capital": 100000000,
+    "risk_fraction": 0.01,
+    "max_positions": 3,
+    "max_sector_fraction": 0.35,
+    "max_order_adv_fraction": 0.05,
+    "lot_size": 100,
+    "buy_fee_fraction": 0.0015,
+    "sell_fee_fraction": 0.0015,
+    "sell_tax_fraction": 0.001,
+    "slippage_fraction": 0.0005,
+    "minimum_composite_score": 75.0,
+    "minimum_technical_only_score": 75.0
+  },
+  "data_source": "C:\\Users\\HAI NAM\\Finance1\\outputs\\model_sample_extension_20260920\\yahoo_vn_model_sample_2020_2026.xlsx",
+  "breadth_source": "C:\\Users\\HAI NAM\\Finance1\\Bot tele\\crawl data\\Project_python3\\data",
+  "price_symbols": 15,
+  "breadth_symbol_count_latest": 361,
+  "date_start": "2020-02-06",
+  "date_end": "2026-09-11",
+  "limitations": [
+    "Selected 15-symbol sample has survivorship/selection bias.",
+    "Broad market breadth uses unadjusted Vietcap close because adjusted history is absent.",
+    "Signals use adjusted OHLC; fills and PnL use raw prices, without a corporate-action cash ledger.",
+    "Historical fundamental revisions and ratio point-in-time provenance are not verified.",
+    "Brokerage, tax and slippage are research assumptions and require sensitivity tests."
+  ],
+  "results": [
+    {
+      "branch": "TFM",
+      "initial_capital": 100000000,
+      "final_equity": 113484170.43566583,
+      "total_return_pct": 13.484170435665831,
+      "max_drawdown_pct": -8.451298885646608,
+      "closed_trades": 68,
+      "open_positions": 1,
+      "win_rate_pct": 35.294117647058826,
+      "fee_tax_slippage_assumed_zero": false
+    },
+    {
+      "branch": "TECHNICAL_ONLY",
+      "initial_capital": 100000000,
+      "final_equity": 98388664.9843183,
+      "total_return_pct": -1.611335015681703,
+      "max_drawdown_pct": -2.388318967246894,
+      "closed_trades": 3,
+      "open_positions": 0,
+      "win_rate_pct": 33.33333333333333,
+      "fee_tax_slippage_assumed_zero": false
+    }
+  ]
+}
